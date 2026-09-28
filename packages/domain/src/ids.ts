@@ -1,0 +1,28 @@
+import type { Id } from "@kilic/shared";
+
+export type UserId = Id<"UserId">;
+export type WorkspaceId = Id<"WorkspaceId">;
+export type ProjectId = Id<"ProjectId">;
+export type RepositoryId = Id<"RepositoryId">;
+export type RepositoryCheckoutId = Id<"RepositoryCheckoutId">;
+export type ProjectRelationId = Id<"ProjectRelationId">;
+export type OrchestratorId = Id<"OrchestratorId">;
+export type OperationId = Id<"OperationId">;
+export type TaskId = Id<"TaskId">;
+export type HarnessId = Id<"HarnessId">;
+export type ModelId = Id<"ModelId">;
+export type RoutingPolicyId = Id<"RoutingPolicyId">;
+export type RoleRouteId = Id<"RoleRouteId">;
+export type RuntimeSessionId = Id<"RuntimeSessionId">;
+export type AgentRunId = Id<"AgentRunId">;
+export type MemoryItemId = Id<"MemoryItemId">;
+export type DecisionId = Id<"DecisionId">;
+export type FindingId = Id<"FindingId">;
+export type CheckpointId = Id<"CheckpointId">;
+export type EventId = Id<"EventId">;
+export type ArtifactId = Id<"ArtifactId">;
+export type ExecutionNodeId = Id<"ExecutionNodeId">;
+export type PolicyRuleId = Id<"PolicyRuleId">;
+export type ApprovalId = Id<"ApprovalId">;
+export type WorktreeId = Id<"WorktreeId">;
+export type CorrelationId = Id<"CorrelationId">;

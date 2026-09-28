@@ -1,0 +1,19 @@
+{
+  "name": "@kilic/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "kilic": "./src/main.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --passWithNoTests",
+    "start": "tsx src/main.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.5",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}
