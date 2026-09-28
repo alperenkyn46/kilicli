@@ -1,5 +1,10 @@
 export type {
   AgentRunId,
+  ExecutionJobId,
+  ExecutionDigestId,
+  EffectGrantId,
+  RuntimeHandoffId,
+  DigestIngestionId,
   ApprovalId,
   ArtifactId,
   CheckpointId,
@@ -38,6 +43,9 @@ export type {
   ContextHealth,
   ExecutionNodeKind,
   ExecutionNodeStatus,
+  ExecutionJobStatus,
+  RuntimeHandoffStatus,
+  DigestIngestionStatus,
   ExecutionProfile,
   KnowledgeClass,
   MembershipRole,
@@ -59,6 +67,9 @@ export {
   ACCESS_MODES,
   AGENT_RUN_KINDS,
   AGENT_RUN_STATUSES,
+  EXECUTION_JOB_STATUSES,
+  RUNTIME_HANDOFF_STATUSES,
+  DIGEST_INGESTION_STATUSES,
   APPROVAL_STATUSES,
   CHECKOUT_STATUSES,
   CHECKPOINT_TRIGGERS,
@@ -86,6 +97,11 @@ export {
 
 export type {
   AgentRun,
+  ExecutionJob,
+  ExecutionDigest,
+  EffectGrant,
+  RuntimeHandoff,
+  DigestIngestion,
   Approval,
   Artifact,
   Checkpoint,
@@ -153,3 +169,4 @@ export {
 } from "./project-identity.js";
 
 export type { MemorySearchQuery, Repositories } from "./repositories.js";
+export { principalKey, type Principal, type UserPrincipal, type ServicePrincipal, type ExecutionNodePrincipal, type ScopedToolPrincipal } from "./principals.js";

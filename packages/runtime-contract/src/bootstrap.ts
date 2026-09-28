@@ -13,6 +13,7 @@ export type BootstrapCheckpointState = {
  */
 export type BootstrapContext = {
   doctrinePath: string;
+  doctrineText: string;
   identity: {
     orchestratorId: string;
     kind: "workspace" | "project";
@@ -47,6 +48,7 @@ export type BootstrapContext = {
     state: BootstrapCheckpointState;
     createdAt: string;
   } | null;
+  policies: Array<{ action: string; effect: "allow" | "deny" | "require_approval"; scopeType: string }>;
   memories: Array<{
     id: string;
     scopeType: string;
@@ -66,12 +68,14 @@ export type BootstrapContext = {
 export type ToolSurface = {
   memory: boolean;
   workforce: boolean;
+  /** Effect-capable tools must be installed through the execution broker. */
+  effectExecution: "brokered_only";
 };
 
 export type SessionStartRequest = {
   role: string;
   modelKey?: string;
   cwd?: string;
-  bootstrap?: BootstrapContext;
-  tools?: ToolSurface;
+  bootstrap: BootstrapContext;
+  tools: ToolSurface;
 };

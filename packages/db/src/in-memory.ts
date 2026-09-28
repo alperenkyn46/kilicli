@@ -2,6 +2,11 @@ import { DomainError } from "@kilic/shared";
 import { matchesMemoryQuery } from "./memory-query.js";
 import type {
   AgentRun,
+  ExecutionJob,
+  ExecutionDigest,
+  EffectGrant,
+  RuntimeHandoff,
+  DigestIngestion,
   Approval,
   Artifact,
   Checkpoint,
@@ -51,6 +56,11 @@ export function createInMemoryRepositories(): Repositories {
   const roleRoutes = new Map<string, RoleRoute>();
   const runtimeSessions = new Map<string, RuntimeSession>();
   const agentRuns = new Map<string, AgentRun>();
+  const executionJobs = new Map<string, ExecutionJob>();
+  const executionDigests = new Map<string, ExecutionDigest>();
+  const effectGrants = new Map<string, EffectGrant>();
+  const runtimeHandoffs = new Map<string, RuntimeHandoff>();
+  const digestIngestions = new Map<string, DigestIngestion>();
   const memoryItems = new Map<string, MemoryItem>();
   const decisions = new Map<string, Decision>();
   const findings = new Map<string, Finding>();
@@ -80,6 +90,11 @@ export function createInMemoryRepositories(): Repositories {
     roleRoutes: Map<string, RoleRoute>;
     runtimeSessions: Map<string, RuntimeSession>;
     agentRuns: Map<string, AgentRun>;
+    executionJobs: Map<string, ExecutionJob>;
+    executionDigests: Map<string, ExecutionDigest>;
+    effectGrants: Map<string, EffectGrant>;
+    runtimeHandoffs: Map<string, RuntimeHandoff>;
+    digestIngestions: Map<string, DigestIngestion>;
     memoryItems: Map<string, MemoryItem>;
     decisions: Map<string, Decision>;
     findings: Map<string, Finding>;
@@ -111,6 +126,11 @@ export function createInMemoryRepositories(): Repositories {
     roleRoutes: cloneMap(roleRoutes),
     runtimeSessions: cloneMap(runtimeSessions),
     agentRuns: cloneMap(agentRuns),
+    executionJobs: cloneMap(executionJobs),
+    executionDigests: cloneMap(executionDigests),
+    effectGrants: cloneMap(effectGrants),
+    runtimeHandoffs: cloneMap(runtimeHandoffs),
+    digestIngestions: cloneMap(digestIngestions),
     memoryItems: cloneMap(memoryItems),
     decisions: cloneMap(decisions),
     findings: cloneMap(findings),
@@ -144,6 +164,11 @@ export function createInMemoryRepositories(): Repositories {
     restoreMap(roleRoutes, snap.roleRoutes);
     restoreMap(runtimeSessions, snap.runtimeSessions);
     restoreMap(agentRuns, snap.agentRuns);
+    restoreMap(executionJobs, snap.executionJobs);
+    restoreMap(executionDigests, snap.executionDigests);
+    restoreMap(effectGrants, snap.effectGrants);
+    restoreMap(runtimeHandoffs, snap.runtimeHandoffs);
+    restoreMap(digestIngestions, snap.digestIngestions);
     restoreMap(memoryItems, snap.memoryItems);
     restoreMap(decisions, snap.decisions);
     restoreMap(findings, snap.findings);
@@ -265,6 +290,7 @@ export function createInMemoryRepositories(): Repositories {
           ) ?? null
         );
       },
+      async listByNode(executionNodeId) { return [...repositoryCheckouts.values()].filter((item) => item.executionNodeId === executionNodeId); },
     },
     projectRelations: {
       async insert(relation) {
@@ -315,6 +341,12 @@ export function createInMemoryRepositories(): Repositories {
         const current = requireRow(operations, id, "Operation");
         operations.set(id, { ...current, status, updatedAt });
       },
+      async transition(id, from, to, updatedAt) {
+        const current = operations.get(id);
+        if (!current || current.status !== from) return false;
+        operations.set(id, { ...current, status: to, updatedAt });
+        return true;
+      },
     },
     tasks: {
       async insert(task) {
@@ -329,6 +361,12 @@ export function createInMemoryRepositories(): Repositories {
       async setStatus(id, status, updatedAt) {
         const current = requireRow(tasks, id, "Task");
         tasks.set(id, { ...current, status, updatedAt });
+      },
+      async transition(id, from, to, updatedAt) {
+        const current = tasks.get(id);
+        if (!current || current.status !== from) return false;
+        tasks.set(id, { ...current, status: to, updatedAt });
+        return true;
       },
     },
     taskDependencies: {
@@ -430,12 +468,21 @@ export function createInMemoryRepositories(): Repositories {
         const current = requireRow(runtimeSessions, id, "Runtime session");
         runtimeSessions.set(id, { ...current, ...patch });
       },
+      async transition(id, from, patch) {
+        const current = runtimeSessions.get(id);
+        if (!current || current.status !== from) return false;
+        runtimeSessions.set(id, { ...current, ...patch });
+        return true;
+      },
       async attachAdapter(id, adapterSessionId, executionEpoch, updatedAt) {
-        const current = requireRow(runtimeSessions, id, "Runtime session");
+        const current = runtimeSessions.get(id);
+        if (!current || current.status !== "starting" || current.adapterSessionId !== null) return false;
         runtimeSessions.set(id, { ...current, adapterSessionId, executionEpoch, updatedAt });
+        return true;
       },
       async rearm(id, updatedAt) {
         const current = requireRow(runtimeSessions, id, "Runtime session");
+        if (current.status !== "failed" && current.status !== "interrupted") throw new DomainError("INVALID_TRANSITION", "Session is not retryable");
         runtimeSessions.set(id, {
           ...current,
           status: "starting",
@@ -461,13 +508,121 @@ export function createInMemoryRepositories(): Repositories {
         const current = requireRow(agentRuns, id, "Agent run");
         agentRuns.set(id, { ...current, status, updatedAt, endedAt });
       },
+      async transition(id, from, to, updatedAt, endedAt) {
+        const current = agentRuns.get(id);
+        if (!current || current.status !== from) return false;
+        agentRuns.set(id, { ...current, status: to, updatedAt, endedAt });
+        return true;
+      },
       async rearm(id, updatedAt) {
         const current = requireRow(agentRuns, id, "Agent run");
+        if (current.status !== "failed") throw new DomainError("INVALID_TRANSITION", "Run is not retryable");
         agentRuns.set(id, { ...current, status: "planned", endedAt: null, updatedAt });
       },
       async attachSession(id, runtimeSessionId, updatedAt) {
         const current = requireRow(agentRuns, id, "Agent run");
         agentRuns.set(id, { ...current, runtimeSessionId, updatedAt });
+      },
+    },
+    executionJobs: {
+      async insert(job) {
+        const existing = [...executionJobs.values()].find((item) => item.workspaceId === job.workspaceId && item.idempotencyKey === job.idempotencyKey);
+        if (existing) {
+          if (existing.requestFingerprint !== job.requestFingerprint) throw new DomainError("CONFLICT", "Idempotency key has different request content");
+          return existing;
+        }
+        executionJobs.set(job.id, job);
+        return job;
+      },
+      async get(id) { return executionJobs.get(id) ?? null; },
+      async getByIdempotencyKey(workspaceId, key) { return [...executionJobs.values()].find((item) => item.workspaceId === workspaceId && item.idempotencyKey === key) ?? null; },
+      async getByRun(runId) { return [...executionJobs.values()].find((item) => item.agentRunId === runId) ?? null; },
+      async listByNode(nodeId) { return [...executionJobs.values()].filter((item) => item.executionNodeId === nodeId); },
+      async claim(id, nodeId, epoch, leaseUntil, now) {
+        const job = executionJobs.get(id);
+        if (!job || job.status !== "planned" || job.executionNodeId !== nodeId || executionNodes.get(nodeId)?.bootId !== epoch) return false;
+        executionJobs.set(id, { ...job, status: "claimed", claimEpoch: epoch, leaseUntil, updatedAt: now });
+        return true;
+      },
+      async renew(id, nodeId, epoch, leaseUntil, now) {
+        const job = executionJobs.get(id);
+        if (!job || job.executionNodeId !== nodeId || job.claimEpoch !== epoch || !job.leaseUntil || job.leaseUntil <= now || executionNodes.get(nodeId)?.bootId !== epoch || !["claimed", "bootstrapping", "running", "awaiting_approval"].includes(job.status)) return false;
+        executionJobs.set(id, { ...job, leaseUntil, updatedAt: now });
+        return true;
+      },
+      async transition(id, from, to, patch, now) {
+        const job = executionJobs.get(id);
+        if (!job || job.status !== from) return false;
+        executionJobs.set(id, { ...job, ...patch, status: to, updatedAt: now });
+        return true;
+      },
+    },
+    executionDigests: {
+      async insert(digest) {
+        const prior = [...executionDigests.values()].find((item) => item.executionJobId === digest.executionJobId && item.sourceDigest === digest.sourceDigest);
+        if (prior) return prior;
+        executionDigests.set(digest.id, digest);
+        return digest;
+      },
+      async get(id) { return executionDigests.get(id) ?? null; },
+      async getBySource(jobId, sourceDigest) { return [...executionDigests.values()].find((item) => item.executionJobId === jobId && item.sourceDigest === sourceDigest) ?? null; },
+    },
+    effectGrants: {
+      async insert(grant) {
+        const prior = [...effectGrants.values()].find((item) => item.executionJobId === grant.executionJobId && item.requestKey === grant.requestKey);
+        if (prior) return prior;
+        effectGrants.set(grant.id, grant);
+        return grant;
+      },
+      async get(id) { return effectGrants.get(id) ?? null; },
+      async getByRequest(jobId, requestKey) { return [...effectGrants.values()].find((item) => item.executionJobId === jobId && item.requestKey === requestKey) ?? null; },
+      async consume(id, now) {
+        const grant = effectGrants.get(id);
+        if (!grant || grant.consumedAt || grant.expiresAt <= now) return false;
+        effectGrants.set(id, { ...grant, consumedAt: now });
+        return true;
+      },
+    },
+    runtimeHandoffs: {
+      async insert(handoff) { runtimeHandoffs.set(handoff.id, handoff); },
+      async get(id) { return runtimeHandoffs.get(id) ?? null; },
+      async listByNode(nodeId) { return [...runtimeHandoffs.values()].filter((item) => runtimeSessions.get(item.predecessorSessionId)?.executionNodeId === nodeId); },
+      async latestForPredecessor(sessionId) { return [...runtimeHandoffs.values()].filter((item) => item.predecessorSessionId === sessionId).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0] ?? null; },
+      async findBySuccessor(sessionId) { return [...runtimeHandoffs.values()].find((item) => item.successorSessionId === sessionId) ?? null; },
+      async transition(id, from, to, patch, now) {
+        const current = runtimeHandoffs.get(id);
+        if (!current || current.status !== from) return false;
+        runtimeHandoffs.set(id, { ...current, ...patch, status: to, updatedAt: now });
+        return true;
+      },
+    },
+    digestIngestions: {
+      async enqueue(item) {
+        const prior = [...digestIngestions.values()].find((value) => value.executionJobId === item.executionJobId && value.sourceDigest === item.sourceDigest);
+        if (prior) return prior;
+        digestIngestions.set(item.id, item);
+        return item;
+      },
+      async get(id) { return digestIngestions.get(id) ?? null; },
+      async claimDue(now) {
+        const item = [...digestIngestions.values()].filter((value) =>
+          ((value.status === "pending" || value.status === "retry") && value.nextAttemptAt <= now) ||
+          (value.status === "processing" && value.updatedAt.getTime() <= now.getTime() - 5 * 60_000),
+        ).sort((a, b) => a.nextAttemptAt.getTime() - b.nextAttemptAt.getTime())[0];
+        if (!item) return null;
+        const claimed = { ...item, status: "processing" as const, attempts: item.attempts + 1, updatedAt: now };
+        digestIngestions.set(item.id, claimed);
+        return claimed;
+      },
+      async complete(id, digestId, attempts, now) {
+        const item = requireRow(digestIngestions, id, "Digest ingestion");
+        if (item.status !== "processing" || item.attempts !== attempts) throw new DomainError("CONFLICT", "Digest claim changed before completion");
+        digestIngestions.set(id, { ...item, status: "completed", digestId, updatedAt: now });
+      },
+      async retry(id, error, nextAttemptAt, attempts, now) {
+        const item = requireRow(digestIngestions, id, "Digest ingestion");
+        if (item.status !== "processing" || item.attempts !== attempts) throw new DomainError("CONFLICT", "Digest claim changed before retry");
+        digestIngestions.set(id, { ...item, status: "retry", lastError: error, nextAttemptAt, updatedAt: now });
       },
     },
     memoryItems: {
@@ -478,7 +633,7 @@ export function createInMemoryRepositories(): Repositories {
         return memoryItems.get(id) ?? null;
       },
       async search(query) {
-        return [...memoryItems.values()].filter((item) => item.status === "active" && matchesMemoryQuery(item, query));
+        return [...memoryItems.values()].filter((item) => item.status === "active" && matchesMemoryQuery(item, query)).slice(0, query.limit ?? 20);
       },
       async setStatus(id, status, supersededById, updatedAt) {
         const current = requireRow(memoryItems, id, "Memory item");
@@ -518,6 +673,19 @@ export function createInMemoryRepositories(): Repositories {
             .filter((checkpoint) => checkpoint.orchestratorId === orchestratorId)
             .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())[0] ?? null
         );
+      },
+      async latestRelevant(orchestratorId, operationId, taskId) {
+        const ranked = [...checkpoints.values()]
+          .filter((item) => item.orchestratorId === orchestratorId && (
+            (taskId && item.taskId === taskId) ||
+            (operationId && item.taskId === null && item.operationId === operationId) ||
+            (item.taskId === null && item.operationId === null)
+          ))
+          .sort((a, b) => {
+            const rank = (item: Checkpoint) => item.taskId === taskId && taskId ? 0 : item.operationId === operationId && operationId ? 1 : 2;
+            return rank(a) - rank(b) || b.createdAt.getTime() - a.createdAt.getTime();
+          });
+        return ranked[0] ?? null;
       },
     },
     events: {
@@ -566,6 +734,9 @@ export function createInMemoryRepositories(): Repositories {
       async get(id) {
         return approvals.get(id) ?? null;
       },
+      async findEffectRequest(jobId, requestKey) {
+        return [...approvals.values()].find((item) => item.payload.executionJobId === jobId && item.payload.requestKey === requestKey) ?? null;
+      },
       async decide(id, status, decidedAt) {
         const current = requireRow(approvals, id, "Approval");
         approvals.set(id, { ...current, status, decidedAt });
@@ -578,6 +749,8 @@ export function createInMemoryRepositories(): Repositories {
       async get(id) {
         return worktrees.get(id) ?? null;
       },
+      async listByNode(executionNodeId) { return [...worktrees.values()].filter((item) => item.executionNodeId === executionNodeId); },
+      async findActiveByRun(agentRunId) { return [...worktrees.values()].find((item) => item.agentRunId === agentRunId && item.status === "active") ?? null; },
       async markRemoved(id, removedAt) {
         const current = requireRow(worktrees, id, "Worktree");
         worktrees.set(id, { ...current, status: "removed", removedAt });

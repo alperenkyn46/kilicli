@@ -1,0 +1,2 @@
+ALTER TABLE "execution_jobs" ADD COLUMN "pending_approval_id" uuid;--> statement-breakpoint
+ALTER TABLE "execution_jobs" ADD CONSTRAINT "execution_jobs_pending_approval_id_approvals_id_fk" FOREIGN KEY ("pending_approval_id") REFERENCES "public"."approvals"("id") ON DELETE no action ON UPDATE no action;

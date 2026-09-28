@@ -1,9 +1,17 @@
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import { asId, DomainError } from "@kilic/shared";
 import type {
   AccessMode,
   AgentRun,
+  ExecutionJob,
+  ExecutionDigest,
+  EffectGrant,
+  RuntimeHandoff,
+  DigestIngestion,
+  DigestIngestionStatus,
+  RuntimeHandoffStatus,
+  ExecutionJobStatus,
   AgentRunKind,
   AgentRunStatus,
   Approval,
@@ -201,6 +209,9 @@ function bind(db: Database): Repositories {
         );
         return row ? mapCheckout(row) : null;
       },
+      async listByNode(executionNodeId) {
+        return (await db.select().from(schema.repositoryCheckouts).where(eq(schema.repositoryCheckouts.executionNodeId, executionNodeId))).map(mapCheckout);
+      },
     },
     projectRelations: {
       async insert(relation) {
@@ -261,6 +272,10 @@ function bind(db: Database): Repositories {
           operationId,
         );
       },
+      async transition(operationId, from, to, updatedAt) {
+        const rows = await db.update(schema.operations).set({ status: to, updatedAt }).where(and(eq(schema.operations.id, operationId), eq(schema.operations.status, from))).returning({ id: schema.operations.id });
+        return rows.length === 1;
+      },
     },
     tasks: {
       async insert(task) {
@@ -280,6 +295,10 @@ function bind(db: Database): Repositories {
           "Task",
           taskId,
         );
+      },
+      async transition(taskId, from, to, updatedAt) {
+        const rows = await db.update(schema.tasks).set({ status: to, updatedAt }).where(and(eq(schema.tasks.id, taskId), eq(schema.tasks.status, from))).returning({ id: schema.tasks.id });
+        return rows.length === 1;
       },
     },
     taskDependencies: {
@@ -392,16 +411,15 @@ function bind(db: Database): Repositories {
           sessionId,
         );
       },
+      async transition(sessionId, from, patch) {
+        const rows = await db.update(schema.runtimeSessions).set(patch).where(and(eq(schema.runtimeSessions.id, sessionId), eq(schema.runtimeSessions.status, from))).returning({ id: schema.runtimeSessions.id });
+        return rows.length === 1;
+      },
       async attachAdapter(sessionId, adapterSessionId, executionEpoch, updatedAt) {
-        await updated(
-          db
-            .update(schema.runtimeSessions)
-            .set({ adapterSessionId, executionEpoch, updatedAt })
-            .where(eq(schema.runtimeSessions.id, sessionId))
-            .returning({ id: schema.runtimeSessions.id }),
-          "Runtime session",
-          sessionId,
-        );
+        const rows = await db.update(schema.runtimeSessions).set({ adapterSessionId, executionEpoch, updatedAt })
+          .where(and(eq(schema.runtimeSessions.id, sessionId), eq(schema.runtimeSessions.status, "starting"), isNull(schema.runtimeSessions.adapterSessionId)))
+          .returning({ id: schema.runtimeSessions.id });
+        return rows.length === 1;
       },
       async rearm(sessionId, updatedAt) {
         await updated(
@@ -415,7 +433,7 @@ function bind(db: Database): Repositories {
               endedAt: null,
               updatedAt,
             })
-            .where(eq(schema.runtimeSessions.id, sessionId))
+            .where(and(eq(schema.runtimeSessions.id, sessionId), inArray(schema.runtimeSessions.status, ["failed", "interrupted"])))
             .returning({ id: schema.runtimeSessions.id }),
           "Runtime session",
           sessionId,
@@ -445,12 +463,16 @@ function bind(db: Database): Repositories {
           runId,
         );
       },
+      async transition(runId, from, to, updatedAt, endedAt) {
+        const rows = await db.update(schema.agentRuns).set({ status: to, updatedAt, endedAt }).where(and(eq(schema.agentRuns.id, runId), eq(schema.agentRuns.status, from))).returning({ id: schema.agentRuns.id });
+        return rows.length === 1;
+      },
       async rearm(runId, updatedAt) {
         await updated(
           db
             .update(schema.agentRuns)
             .set({ status: "planned", endedAt: null, updatedAt })
-            .where(eq(schema.agentRuns.id, runId))
+            .where(and(eq(schema.agentRuns.id, runId), eq(schema.agentRuns.status, "failed")))
             .returning({ id: schema.agentRuns.id }),
           "Agent run",
           runId,
@@ -468,6 +490,137 @@ function bind(db: Database): Repositories {
         );
       },
     },
+    executionJobs: {
+      async insert(job) {
+        await db.insert(schema.executionJobs).values(job).onConflictDoNothing({ target: [schema.executionJobs.workspaceId, schema.executionJobs.idempotencyKey] });
+        const stored = await this.getByIdempotencyKey(job.workspaceId, job.idempotencyKey);
+        if (!stored) throw new DomainError("NOT_FOUND", "Execution job was not stored");
+        if (stored.requestFingerprint !== job.requestFingerprint) throw new DomainError("CONFLICT", "Idempotency key has different request content");
+        return stored;
+      },
+      async get(jobId) {
+        const row = await one(db.select().from(schema.executionJobs).where(eq(schema.executionJobs.id, jobId)).limit(1));
+        return row ? mapExecutionJob(row) : null;
+      },
+      async getByIdempotencyKey(workspaceId, key) {
+        const row = await one(db.select().from(schema.executionJobs).where(and(eq(schema.executionJobs.workspaceId, workspaceId), eq(schema.executionJobs.idempotencyKey, key))).limit(1));
+        return row ? mapExecutionJob(row) : null;
+      },
+      async getByRun(runId) {
+        const row = await one(db.select().from(schema.executionJobs).where(eq(schema.executionJobs.agentRunId, runId)).limit(1));
+        return row ? mapExecutionJob(row) : null;
+      },
+      async listByNode(nodeId) {
+        return (await db.select().from(schema.executionJobs).where(eq(schema.executionJobs.executionNodeId, nodeId))).map(mapExecutionJob);
+      },
+      async claim(jobId, nodeId, epoch, leaseUntil, now) {
+        const rows = await db.update(schema.executionJobs).set({ status: "claimed", claimEpoch: epoch, leaseUntil, updatedAt: now }).where(and(eq(schema.executionJobs.id, jobId), eq(schema.executionJobs.executionNodeId, nodeId), eq(schema.executionJobs.status, "planned"), sql`exists (select 1 from execution_nodes where id = ${nodeId} and boot_id = ${epoch})`)).returning({ id: schema.executionJobs.id });
+        return rows.length === 1;
+      },
+      async renew(jobId, nodeId, epoch, leaseUntil, now) {
+        const rows = await db.update(schema.executionJobs).set({ leaseUntil, updatedAt: now }).where(and(
+          eq(schema.executionJobs.id, jobId), eq(schema.executionJobs.executionNodeId, nodeId),
+          eq(schema.executionJobs.claimEpoch, epoch), inArray(schema.executionJobs.status, ["claimed", "bootstrapping", "running", "awaiting_approval"]),
+          gt(schema.executionJobs.leaseUntil, now),
+          sql`exists (select 1 from execution_nodes where id = ${nodeId} and boot_id = ${epoch})`,
+        )).returning({ id: schema.executionJobs.id });
+        return rows.length === 1;
+      },
+      async transition(jobId, from, to, patch, now) {
+        const rows = await db.update(schema.executionJobs).set({ ...patch, status: to, updatedAt: now }).where(and(eq(schema.executionJobs.id, jobId), eq(schema.executionJobs.status, from))).returning({ id: schema.executionJobs.id });
+        return rows.length === 1;
+      },
+    },
+    executionDigests: {
+      async insert(digest) {
+        await db.insert(schema.executionDigests).values(digest).onConflictDoNothing({ target: [schema.executionDigests.executionJobId, schema.executionDigests.sourceDigest] });
+        const stored = await this.getBySource(digest.executionJobId, digest.sourceDigest);
+        if (!stored) throw new DomainError("NOT_FOUND", "Execution digest was not stored");
+        return stored;
+      },
+      async get(digestId) {
+        const row = await one(db.select().from(schema.executionDigests).where(eq(schema.executionDigests.id, digestId)).limit(1));
+        return row ? mapExecutionDigest(row) : null;
+      },
+      async getBySource(jobId, sourceDigest) {
+        const row = await one(db.select().from(schema.executionDigests).where(and(eq(schema.executionDigests.executionJobId, jobId), eq(schema.executionDigests.sourceDigest, sourceDigest))).limit(1));
+        return row ? mapExecutionDigest(row) : null;
+      },
+    },
+    effectGrants: {
+      async insert(grant) {
+        await db.insert(schema.effectGrants).values(grant).onConflictDoNothing({ target: [schema.effectGrants.executionJobId, schema.effectGrants.requestKey] });
+        const stored = await this.getByRequest(grant.executionJobId, grant.requestKey);
+        if (!stored) throw new DomainError("NOT_FOUND", "Effect grant was not stored");
+        return stored;
+      },
+      async get(grantId) {
+        const row = await one(db.select().from(schema.effectGrants).where(eq(schema.effectGrants.id, grantId)).limit(1));
+        return row ? mapEffectGrant(row) : null;
+      },
+      async getByRequest(jobId, requestKey) {
+        const row = await one(db.select().from(schema.effectGrants).where(and(eq(schema.effectGrants.executionJobId, jobId), eq(schema.effectGrants.requestKey, requestKey))).limit(1));
+        return row ? mapEffectGrant(row) : null;
+      },
+      async consume(grantId, now) {
+        const rows = await db.update(schema.effectGrants).set({ consumedAt: now }).where(and(eq(schema.effectGrants.id, grantId), sql`${schema.effectGrants.consumedAt} is null`, gt(schema.effectGrants.expiresAt, now))).returning({ id: schema.effectGrants.id });
+        return rows.length === 1;
+      },
+    },
+    runtimeHandoffs: {
+      async insert(handoff) { await attempt(() => db.insert(schema.runtimeHandoffs).values(handoff)); },
+      async get(handoffId) {
+        const row = await one(db.select().from(schema.runtimeHandoffs).where(eq(schema.runtimeHandoffs.id, handoffId)).limit(1));
+        return row ? mapHandoff(row) : null;
+      },
+      async listByNode(nodeId) {
+        const rows = await db.select({ handoff: schema.runtimeHandoffs }).from(schema.runtimeHandoffs)
+          .innerJoin(schema.runtimeSessions, eq(schema.runtimeHandoffs.predecessorSessionId, schema.runtimeSessions.id))
+          .where(eq(schema.runtimeSessions.executionNodeId, nodeId));
+        return rows.map((row) => mapHandoff(row.handoff));
+      },
+      async latestForPredecessor(sessionId) {
+        const row = await one(db.select().from(schema.runtimeHandoffs).where(eq(schema.runtimeHandoffs.predecessorSessionId, sessionId)).orderBy(desc(schema.runtimeHandoffs.createdAt)).limit(1));
+        return row ? mapHandoff(row) : null;
+      },
+      async findBySuccessor(sessionId) {
+        const row = await one(db.select().from(schema.runtimeHandoffs).where(eq(schema.runtimeHandoffs.successorSessionId, sessionId)).limit(1));
+        return row ? mapHandoff(row) : null;
+      },
+      async transition(handoffId, from, to, patch, now) {
+        const rows = await db.update(schema.runtimeHandoffs).set({ ...patch, status: to, updatedAt: now }).where(and(eq(schema.runtimeHandoffs.id, handoffId), eq(schema.runtimeHandoffs.status, from))).returning({ id: schema.runtimeHandoffs.id });
+        return rows.length === 1;
+      },
+    },
+    digestIngestions: {
+      async enqueue(item) {
+        await db.insert(schema.digestIngestions).values(item).onConflictDoNothing({ target: [schema.digestIngestions.executionJobId, schema.digestIngestions.sourceDigest] });
+        const row = await one(db.select().from(schema.digestIngestions).where(and(eq(schema.digestIngestions.executionJobId, item.executionJobId), eq(schema.digestIngestions.sourceDigest, item.sourceDigest))).limit(1));
+        if (!row) throw new DomainError("NOT_FOUND", "Digest ingestion was not stored");
+        return mapDigestIngestion(row);
+      },
+      async get(id) {
+        const row = await one(db.select().from(schema.digestIngestions).where(eq(schema.digestIngestions.id, id)).limit(1));
+        return row ? mapDigestIngestion(row) : null;
+      },
+      async claimDue(now) {
+        const staleAt = new Date(now.getTime() - 5 * 60_000);
+        const due = or(
+          and(inArray(schema.digestIngestions.status, ["pending", "retry"]), lte(schema.digestIngestions.nextAttemptAt, now)),
+          and(eq(schema.digestIngestions.status, "processing"), lte(schema.digestIngestions.updatedAt, staleAt)),
+        );
+        const candidate = await one(db.select().from(schema.digestIngestions).where(due).orderBy(asc(schema.digestIngestions.nextAttemptAt)).limit(1));
+        if (!candidate) return null;
+        const rows = await db.update(schema.digestIngestions).set({ status: "processing", attempts: sql`${schema.digestIngestions.attempts} + 1`, updatedAt: now }).where(and(eq(schema.digestIngestions.id, candidate.id), eq(schema.digestIngestions.status, candidate.status), eq(schema.digestIngestions.attempts, candidate.attempts), due)).returning();
+        return rows[0] ? mapDigestIngestion(rows[0]) : null;
+      },
+      async complete(id, digestId, attempts, now) {
+        await updated(db.update(schema.digestIngestions).set({ status: "completed", digestId, updatedAt: now }).where(and(eq(schema.digestIngestions.id, id), eq(schema.digestIngestions.status, "processing"), eq(schema.digestIngestions.attempts, attempts))).returning({ id: schema.digestIngestions.id }), "Digest ingestion", id);
+      },
+      async retry(id, error, nextAttemptAt, attempts, now) {
+        await updated(db.update(schema.digestIngestions).set({ status: "retry", lastError: error, nextAttemptAt, updatedAt: now }).where(and(eq(schema.digestIngestions.id, id), eq(schema.digestIngestions.status, "processing"), eq(schema.digestIngestions.attempts, attempts))).returning({ id: schema.digestIngestions.id }), "Digest ingestion", id);
+      },
+    },
     memoryItems: {
       async insert(item) {
         await attempt(() => db.insert(schema.memoryItems).values(item));
@@ -477,8 +630,19 @@ function bind(db: Database): Repositories {
         return row ? mapMemory(row) : null;
       },
       async search(query) {
-        const rows = await db.select().from(schema.memoryItems).where(eq(schema.memoryItems.status, "active"));
-        return rows.map(mapMemory).filter((item) => matchesMemoryQuery(item, query));
+        const scopes = [query.includeSystemGlobal ? eq(schema.memoryItems.scopeType, "global") : undefined,
+          query.ownerUserId ? and(eq(schema.memoryItems.scopeType, "user"), eq(schema.memoryItems.ownerUserId, query.ownerUserId)) : undefined,
+          query.workspaceId ? and(eq(schema.memoryItems.scopeType, "workspace"), eq(schema.memoryItems.workspaceId, query.workspaceId)) : undefined,
+          query.projectId ? and(eq(schema.memoryItems.scopeType, "project"), eq(schema.memoryItems.projectId, query.projectId)) : undefined,
+          query.operationId ? and(eq(schema.memoryItems.scopeType, "operation"), eq(schema.memoryItems.operationId, query.operationId)) : undefined,
+          query.taskId ? and(eq(schema.memoryItems.scopeType, "task"), eq(schema.memoryItems.taskId, query.taskId)) : undefined,
+          query.agentRunId ? and(eq(schema.memoryItems.scopeType, "run"), eq(schema.memoryItems.agentRunId, query.agentRunId)) : undefined,
+        ].filter((item) => item !== undefined);
+        if (scopes.length === 0) return [];
+        const rows = await db.select().from(schema.memoryItems)
+          .where(and(eq(schema.memoryItems.status, "active"), or(...scopes)))
+          .orderBy(desc(schema.memoryItems.createdAt)).limit(query.text ? 200 : Math.min(query.limit ?? 20, 100));
+        return rows.map(mapMemory).filter((item) => matchesMemoryQuery(item, query)).slice(0, query.limit ?? 20);
       },
       async setStatus(itemId, status, supersededById, updatedAt) {
         await updated(
@@ -540,6 +704,19 @@ function bind(db: Database): Repositories {
         );
         return row ? mapCheckpoint(row) : null;
       },
+      async latestRelevant(orchestratorId, operationId, taskId) {
+        const base = eq(schema.checkpoints.orchestratorId, orchestratorId);
+        if (taskId) {
+          const row = await one(db.select().from(schema.checkpoints).where(and(base, eq(schema.checkpoints.taskId, taskId))).orderBy(desc(schema.checkpoints.createdAt)).limit(1));
+          if (row) return mapCheckpoint(row);
+        }
+        if (operationId) {
+          const row = await one(db.select().from(schema.checkpoints).where(and(base, eq(schema.checkpoints.operationId, operationId), isNull(schema.checkpoints.taskId))).orderBy(desc(schema.checkpoints.createdAt)).limit(1));
+          if (row) return mapCheckpoint(row);
+        }
+        const row = await one(db.select().from(schema.checkpoints).where(and(base, isNull(schema.checkpoints.operationId), isNull(schema.checkpoints.taskId))).orderBy(desc(schema.checkpoints.createdAt)).limit(1));
+        return row ? mapCheckpoint(row) : null;
+      },
     },
     events: {
       async append(event) {
@@ -599,6 +776,10 @@ function bind(db: Database): Repositories {
         const row = await one(db.select().from(schema.approvals).where(eq(schema.approvals.id, approvalId)).limit(1));
         return row ? mapApproval(row) : null;
       },
+      async findEffectRequest(jobId, requestKey) {
+        const row = await one(db.select().from(schema.approvals).where(and(sql`${schema.approvals.payload}->>'executionJobId' = ${jobId}`, sql`${schema.approvals.payload}->>'requestKey' = ${requestKey}`)).orderBy(desc(schema.approvals.createdAt)).limit(1));
+        return row ? mapApproval(row) : null;
+      },
       async decide(approvalId, status, decidedAt) {
         await updated(
           db
@@ -617,6 +798,13 @@ function bind(db: Database): Repositories {
       },
       async get(worktreeId) {
         const row = await one(db.select().from(schema.worktrees).where(eq(schema.worktrees.id, worktreeId)).limit(1));
+        return row ? mapWorktree(row) : null;
+      },
+      async listByNode(executionNodeId) {
+        return (await db.select().from(schema.worktrees).where(eq(schema.worktrees.executionNodeId, executionNodeId))).map(mapWorktree);
+      },
+      async findActiveByRun(agentRunId) {
+        const row = await one(db.select().from(schema.worktrees).where(and(eq(schema.worktrees.agentRunId, agentRunId), eq(schema.worktrees.status, "active"))).limit(1));
         return row ? mapWorktree(row) : null;
       },
       async markRemoved(worktreeId, removedAt) {
@@ -791,6 +979,78 @@ function mapRun(row: typeof schema.agentRuns.$inferSelect): AgentRun {
     access: row.access as AccessMode,
     status: row.status as AgentRunStatus,
     isolation: (row.isolation ?? null) as IsolationPlan | null,
+  };
+}
+
+function mapExecutionJob(row: typeof schema.executionJobs.$inferSelect): ExecutionJob {
+  return {
+    ...row,
+    id: id("ExecutionJobId", row.id),
+    runtimeSessionId: id("RuntimeSessionId", row.runtimeSessionId),
+    agentRunId: maybe("AgentRunId", row.agentRunId),
+    orchestratorId: id("OrchestratorId", row.orchestratorId),
+    executionNodeId: id("ExecutionNodeId", row.executionNodeId),
+    workspaceId: id("WorkspaceId", row.workspaceId),
+    projectId: maybe("ProjectId", row.projectId),
+    operationId: maybe("OperationId", row.operationId),
+    taskId: maybe("TaskId", row.taskId),
+    repositoryId: maybe("RepositoryId", row.repositoryId),
+    correlationId: id("CorrelationId", row.correlationId),
+    causationId: maybe("EventId", row.causationId),
+    handoffCheckpointId: maybe("CheckpointId", row.handoffCheckpointId),
+    pendingApprovalId: maybe("ApprovalId", row.pendingApprovalId),
+    status: row.status as ExecutionJobStatus,
+  };
+}
+
+function mapExecutionDigest(row: typeof schema.executionDigests.$inferSelect): ExecutionDigest {
+  return {
+    ...row,
+    id: id("ExecutionDigestId", row.id),
+    executionJobId: id("ExecutionJobId", row.executionJobId),
+    runtimeSessionId: id("RuntimeSessionId", row.runtimeSessionId),
+    agentRunId: maybe("AgentRunId", row.agentRunId),
+    workspaceId: id("WorkspaceId", row.workspaceId),
+    projectId: maybe("ProjectId", row.projectId),
+    operationId: maybe("OperationId", row.operationId),
+    taskId: maybe("TaskId", row.taskId),
+  };
+}
+
+function mapEffectGrant(row: typeof schema.effectGrants.$inferSelect): EffectGrant {
+  return {
+    ...row,
+    id: id("EffectGrantId", row.id),
+    executionJobId: id("ExecutionJobId", row.executionJobId),
+    agentRunId: maybe("AgentRunId", row.agentRunId),
+  };
+}
+
+function mapHandoff(row: typeof schema.runtimeHandoffs.$inferSelect): RuntimeHandoff {
+  return {
+    ...row,
+    id: id("RuntimeHandoffId", row.id),
+    predecessorSessionId: id("RuntimeSessionId", row.predecessorSessionId),
+    successorSessionId: maybe("RuntimeSessionId", row.successorSessionId),
+    orchestratorId: id("OrchestratorId", row.orchestratorId),
+    workspaceId: id("WorkspaceId", row.workspaceId),
+    operationId: maybe("OperationId", row.operationId),
+    taskId: maybe("TaskId", row.taskId),
+    checkpointId: maybe("CheckpointId", row.checkpointId),
+    digestId: maybe("ExecutionDigestId", row.digestId),
+    correlationId: id("CorrelationId", row.correlationId),
+    causationId: maybe("EventId", row.causationId),
+    status: row.status as RuntimeHandoffStatus,
+  };
+}
+
+function mapDigestIngestion(row: typeof schema.digestIngestions.$inferSelect): DigestIngestion {
+  return {
+    ...row,
+    id: id("DigestIngestionId", row.id),
+    executionJobId: id("ExecutionJobId", row.executionJobId),
+    digestId: maybe("ExecutionDigestId", row.digestId),
+    status: row.status as DigestIngestionStatus,
   };
 }
 

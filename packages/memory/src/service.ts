@@ -24,7 +24,7 @@ import {
 } from "@kilic/domain";
 
 export type MemoryContext = {
-  userId: UserId;
+  userId?: UserId;
   workspaceId: WorkspaceId;
   projectId?: ProjectId;
   operationId?: OperationId;
@@ -36,7 +36,7 @@ export type MemoryContext = {
 export function searchQueryFor(context: MemoryContext): MemorySearchQuery {
   return {
     includeSystemGlobal: true,
-    ownerUserId: context.userId,
+    ...(context.userId ? { ownerUserId: context.userId } : {}),
     workspaceId: context.workspaceId,
     ...(context.projectId ? { projectId: context.projectId } : {}),
     ...(context.operationId ? { operationId: context.operationId } : {}),
@@ -113,6 +113,20 @@ export class MemoryService {
     return this.repos.memoryItems.get(id);
   }
 
+  async getInContext(id: MemoryItem["id"], context: MemoryContext): Promise<MemoryItem | null> {
+    const item = await this.repos.memoryItems.get(id);
+    if (!item || item.status !== "active") return null;
+    const visible =
+      (item.scopeType === "global" && item.ownerUserId === null) ||
+      (item.scopeType === "user" && context.userId === item.ownerUserId) ||
+      (item.scopeType === "workspace" && context.workspaceId === item.workspaceId) ||
+      (item.scopeType === "project" && context.projectId === item.projectId && context.workspaceId === item.workspaceId) ||
+      (item.scopeType === "operation" && context.operationId === item.operationId && context.workspaceId === item.workspaceId) ||
+      (item.scopeType === "task" && context.taskId === item.taskId && context.operationId === item.operationId && context.projectId === item.projectId && context.workspaceId === item.workspaceId) ||
+      (item.scopeType === "run" && context.agentRunId === item.agentRunId && context.workspaceId === item.workspaceId && (context.projectId === undefined || context.projectId === item.projectId));
+    return visible ? item : null;
+  }
+
   async search(context: MemoryContext): Promise<MemoryItem[]> {
     return this.repos.memoryItems.search(searchQueryFor(context));
   }
@@ -127,11 +141,21 @@ export class MemoryService {
     language?: string | null;
     supersedesId?: DecisionId | null;
   }): Promise<Decision> {
+    const workspace = await this.repos.workspaces.get(input.workspaceId);
+    if (!workspace) throw new DomainError("NOT_FOUND", "Decision workspace was not found");
+    if (input.projectId) {
+      const project = await this.repos.projects.get(input.projectId);
+      if (!project || project.workspaceId !== input.workspaceId) throw new DomainError("INVARIANT", "Decision project is outside workspace");
+    }
+    if (input.operationId) {
+      const operation = await this.repos.operations.get(input.operationId);
+      if (!operation || operation.workspaceId !== input.workspaceId) throw new DomainError("INVARIANT", "Decision operation is outside workspace");
+    }
     if (input.supersedesId) {
       const previous = await this.repos.decisions.get(input.supersedesId);
       if (!previous) throw new DomainError("NOT_FOUND", `Decision ${input.supersedesId} was not found`);
-      if (previous.workspaceId !== input.workspaceId) {
-        throw new DomainError("INVARIANT", "A decision can only supersede another decision in the same workspace");
+      if (previous.workspaceId !== input.workspaceId || previous.projectId !== (input.projectId ?? null) || previous.operationId !== (input.operationId ?? null)) {
+        throw new DomainError("INVARIANT", "A decision can only supersede another decision in the same scope");
       }
     }
     const now = this.clock();
@@ -179,6 +203,16 @@ export class MemoryService {
     language?: string | null;
     knowledgeClass: KnowledgeClass;
   }): Promise<Finding> {
+    const project = await this.repos.projects.get(input.projectId);
+    if (!project || project.workspaceId !== input.workspaceId) throw new DomainError("INVARIANT", "Finding project is outside workspace");
+    if (input.taskId) {
+      const task = await this.repos.tasks.get(input.taskId);
+      if (!task || task.projectId !== input.projectId) throw new DomainError("INVARIANT", "Finding task is outside project");
+    }
+    if (input.agentRunId) {
+      const run = await this.repos.agentRuns.get(input.agentRunId);
+      if (!run || run.projectId !== input.projectId || (input.taskId && run.taskId !== input.taskId)) throw new DomainError("INVARIANT", "Finding run is outside task or project");
+    }
     const now = this.clock();
     const finding: Finding = {
       id: newId<"FindingId">(),

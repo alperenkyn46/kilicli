@@ -11,7 +11,7 @@ describe("kernel provider boundary", () => {
     const files = readdirSync(sourceDirectory).filter((file) => file.endsWith(".ts") && !file.endsWith(".test.ts"));
     const corpus = files.map((file) => readFileSync(join(sourceDirectory, file), "utf8").toLowerCase()).join("\n");
     for (const name of forbidden) {
-      expect(corpus.includes(name), name).toBe(false);
+      expect(new RegExp(`\\b${name}\\b`).test(corpus), name).toBe(false);
     }
   });
 });

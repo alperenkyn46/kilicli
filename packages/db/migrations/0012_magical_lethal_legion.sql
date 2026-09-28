@@ -1,0 +1,1 @@
+ALTER TABLE "execution_jobs" ADD CONSTRAINT "execution_jobs_approval_ck" CHECK ("execution_jobs"."status" <> 'awaiting_approval' OR "execution_jobs"."pending_approval_id" IS NOT NULL);

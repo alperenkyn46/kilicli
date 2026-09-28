@@ -106,6 +106,20 @@ describe("selectRoute", () => {
     expect(selected.ok).toBe(true);
     if (selected.ok) expect(selected.candidate.harnessKey).toBe("beta");
   });
+
+  it("falls from an unavailable profile route to its same-scope neutral route", () => {
+    const profilePolicy: RoutingPolicy = { ...projectPolicy, id: newId<"RoutingPolicyId">(), executionProfile: "quality" };
+    const selected = selectRoute({
+      role: "worker",
+      context: { workspaceId, projectId, operationId: null, profile: "quality" },
+      policies: [globalPolicy, projectPolicy, profilePolicy],
+      routes: [...routes, route(profilePolicy.id, alpha.id, alphaModel.id, 1)],
+      harnesses: [alpha, beta], models: [alphaModel, betaModel],
+      statusByHarnessKey: { alpha: "QUOTA_EXHAUSTED", beta: "AVAILABLE" },
+    });
+    expect(selected.ok).toBe(true);
+    if (selected.ok) expect(selected.candidate.harnessKey).toBe("beta");
+  });
 });
 
 function route(policyId: RoutingPolicy["id"], harnessId: Harness["id"], modelId: Model["id"], priority: number): RoleRoute {

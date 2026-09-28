@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
@@ -11,10 +10,6 @@ export async function migrateDatabase(connectionString: string): Promise<void> {
   await migrate(db, {
     migrationsFolder: fileURLToPath(new URL("../migrations", import.meta.url)),
   });
-  const guards = readFileSync(fileURLToPath(new URL("../sql/append-only.sql", import.meta.url)), "utf8");
-  const scopeGuards = readFileSync(fileURLToPath(new URL("../sql/scope-guards.sql", import.meta.url)), "utf8");
-  await client.unsafe(guards);
-  await client.unsafe(scopeGuards);
   await client.end();
 }
 

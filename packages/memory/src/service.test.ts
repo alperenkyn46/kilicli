@@ -17,7 +17,7 @@ describe("memory scope", () => {
     await repos.projects.insert({ id: tvId, workspaceId, name: "TV", slug: "tv", createdAt: now, updatedAt: now });
 
     const memory = new MemoryService(repos, frozenClock());
-    await memory.remember({
+    const webMemory = await memory.remember({
       scopeType: "project",
       workspaceId,
       projectId: webId,
@@ -41,6 +41,10 @@ describe("memory scope", () => {
     const found = await memory.search({ userId, workspaceId, projectId: webId, text: "çerez" });
     expect(found.map((item) => item.title)).toEqual(["Oturum sınırı"]);
     expect(found[0]?.body).toContain("çerez");
+    const otherWorkspaceId = newId<"WorkspaceId">();
+    await repos.workspaces.insert({ id: otherWorkspaceId, name: "Other", slug: "other", createdAt: now, updatedAt: now });
+    expect(await memory.search({ userId, workspaceId: otherWorkspaceId, projectId: webId, text: "çerez" })).toEqual([]);
+    expect(await memory.getInContext(webMemory.id, { userId, workspaceId: otherWorkspaceId, projectId: webId })).toBeNull();
   });
 });
 

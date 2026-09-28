@@ -1,5 +1,10 @@
 import type {
   AgentRunId,
+  ExecutionJobId,
+  ExecutionDigestId,
+  EffectGrantId,
+  RuntimeHandoffId,
+  DigestIngestionId,
   ApprovalId,
   ArtifactId,
   CheckpointId,
@@ -36,6 +41,9 @@ import type {
   ConfigScope,
   ExecutionNodeKind,
   ExecutionNodeStatus,
+  ExecutionJobStatus,
+  RuntimeHandoffStatus,
+  DigestIngestionStatus,
   ExecutionProfile,
   KnowledgeClass,
   MembershipRole,
@@ -255,6 +263,100 @@ export type AgentRun = {
   isolation: IsolationPlan | null;
   startedAt: Date;
   endedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type ExecutionJob = {
+  id: ExecutionJobId;
+  idempotencyKey: string;
+  requestFingerprint: string;
+  runtimeSessionId: RuntimeSessionId;
+  agentRunId: AgentRunId | null;
+  orchestratorId: OrchestratorId;
+  executionNodeId: ExecutionNodeId;
+  workspaceId: WorkspaceId;
+  projectId: ProjectId | null;
+  operationId: OperationId | null;
+  taskId: TaskId | null;
+  repositoryId: RepositoryId | null;
+  correlationId: CorrelationId;
+  causationId: EventId | null;
+  handoffCheckpointId: CheckpointId | null;
+  pendingApprovalId: ApprovalId | null;
+  status: ExecutionJobStatus;
+  claimEpoch: string | null;
+  leaseUntil: Date | null;
+  startedAt: Date | null;
+  endedAt: Date | null;
+  outcome: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type ExecutionDigest = {
+  id: ExecutionDigestId;
+  executionJobId: ExecutionJobId;
+  runtimeSessionId: RuntimeSessionId;
+  agentRunId: AgentRunId | null;
+  workspaceId: WorkspaceId;
+  projectId: ProjectId | null;
+  operationId: OperationId | null;
+  taskId: TaskId | null;
+  sourceDigest: string;
+  sourceCursor: string | null;
+  summary: string;
+  observedDecisions: string[];
+  observedFindings: string[];
+  touchedArtifacts: string[];
+  verificationResult: string | null;
+  openQuestions: string[];
+  createdAt: Date;
+};
+
+export type EffectGrant = {
+  id: EffectGrantId;
+  principalKey: string;
+  executionJobId: ExecutionJobId;
+  agentRunId: AgentRunId | null;
+  action: string;
+  resource: string;
+  requestKey: string;
+  expiresAt: Date;
+  consumedAt: Date | null;
+  createdAt: Date;
+};
+
+export type RuntimeHandoff = {
+  id: RuntimeHandoffId;
+  predecessorSessionId: RuntimeSessionId;
+  successorSessionId: RuntimeSessionId | null;
+  orchestratorId: OrchestratorId;
+  workspaceId: WorkspaceId;
+  operationId: OperationId | null;
+  taskId: TaskId | null;
+  checkpointId: CheckpointId | null;
+  digestId: ExecutionDigestId | null;
+  repositoryState: Record<string, unknown>;
+  reason: string;
+  status: RuntimeHandoffStatus;
+  correlationId: CorrelationId;
+  causationId: EventId | null;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type DigestIngestion = {
+  id: DigestIngestionId;
+  executionJobId: ExecutionJobId;
+  sourceDigest: string;
+  sourceCursor: string | null;
+  payload: Omit<ExecutionDigest, "id" | "createdAt">;
+  status: DigestIngestionStatus;
+  attempts: number;
+  nextAttemptAt: Date;
+  lastError: string | null;
+  digestId: ExecutionDigestId | null;
   createdAt: Date;
   updatedAt: Date;
 };

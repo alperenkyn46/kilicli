@@ -49,11 +49,7 @@ export function selectRoute(input: {
   const matching = input.policies.filter(
     (policy) => policy.enabled && scopeMatches(policy, input.context) && profileMatches(policy, input.context.profile),
   );
-  const profileSpecific = input.context.profile
-    ? matching.filter((policy) => policy.executionProfile === input.context.profile)
-    : [];
-  const policies = profileSpecific.length > 0 ? profileSpecific : matching.filter((policy) => policy.executionProfile === null || policy.executionProfile === input.context.profile);
-
+  const policies = matching;
   const roleRoutes = input.routes.filter((route) => route.role === input.role && policies.some((policy) => policy.id === route.routingPolicyId));
   if (roleRoutes.length === 0) return { ok: false, reason: "no_matching_policy" };
 
@@ -75,15 +71,22 @@ export function selectRoute(input: {
           {
             policyId: policy.id,
             specificity: tier,
+            profileRank: policy.executionProfile === input.context.profile && input.context.profile !== null ? 0 : 1,
             priority: route.priority,
+            routeId: route.id,
             harnessId: harness.id,
             harnessKey: harness.key,
             modelId: model.id,
             modelKey: model.key,
-          } satisfies RouteCandidate,
+          } satisfies RouteCandidate & { profileRank: number; routeId: string },
         ];
       })
-      .sort((left, right) => left.priority - right.priority);
+      .sort((left, right) =>
+        left.profileRank - right.profileRank ||
+        left.priority - right.priority ||
+        left.policyId.localeCompare(right.policyId) ||
+        left.routeId.localeCompare(right.routeId),
+      );
 
     for (const candidate of ordered) {
       if ((input.statusByHarnessKey[candidate.harnessKey] ?? "OFFLINE") === "AVAILABLE") {

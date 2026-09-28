@@ -1,6 +1,7 @@
 import { asId, DomainError } from "@kilic/shared";
 import type { MemoryService } from "@kilic/memory";
 import type { KnowledgeClass, MemoryScope } from "@kilic/domain";
+import type { ScopedToolPrincipal } from "@kilic/domain";
 
 export const MEMORY_TOOL_NAMES = [
   "memory.search",
@@ -18,29 +19,33 @@ export type ToolResult = {
  * Protocol adapter. It validates tool arguments and calls the memory service.
  * It does not own storage or SQL.
  */
-export async function handleMemoryTool(memory: MemoryService, name: string, args: unknown): Promise<ToolResult> {
+export async function handleMemoryTool(memory: MemoryService, name: string, args: unknown, principal: ScopedToolPrincipal): Promise<ToolResult> {
   const input = record(args);
+  const context = {
+    ...(principal.userId ? { userId: principal.userId } : {}),
+    workspaceId: principal.workspaceId,
+    ...(principal.projectId ? { projectId: principal.projectId } : {}),
+    ...(principal.operationId ? { operationId: principal.operationId } : {}),
+    ...(principal.taskId ? { taskId: principal.taskId } : {}),
+    ...(principal.agentRunId ? { agentRunId: principal.agentRunId } : {}),
+  };
   switch (name) {
     case "memory.search":
       return text(await memory.search({
-        userId: asId<"UserId">(requiredString(input.userId, "userId"), "userId"),
-        workspaceId: asId<"WorkspaceId">(requiredString(input.workspaceId, "workspaceId"), "workspaceId"),
-        ...(typeof input.projectId === "string" ? { projectId: asId<"ProjectId">(input.projectId, "projectId") } : {}),
-        ...(typeof input.operationId === "string" ? { operationId: asId<"OperationId">(input.operationId, "operationId") } : {}),
-        ...(typeof input.taskId === "string" ? { taskId: asId<"TaskId">(input.taskId, "taskId") } : {}),
+        ...context,
         ...(typeof input.text === "string" ? { text: input.text } : {}),
       }));
     case "memory.get":
-      return text(await memory.get(asId<"MemoryItemId">(requiredString(input.id, "id"), "id")));
+      return text(await memory.getInContext(asId<"MemoryItemId">(requiredString(input.id, "id"), "id"), context));
     case "memory.remember_fact":
+      if (!["workspace", "project", "operation", "task", "run"].includes(requiredString(input.scopeType, "scopeType"))) throw new DomainError("FORBIDDEN", "Tool cannot write system or user memory");
       return text(await memory.remember({
         scopeType: requiredString(input.scopeType, "scopeType") as MemoryScope,
-        ownerUserId: optionalUuid(input.ownerUserId, "UserId", "ownerUserId"),
-        workspaceId: optionalUuid(input.workspaceId, "WorkspaceId", "workspaceId"),
-        projectId: optionalUuid(input.projectId, "ProjectId", "projectId"),
-        operationId: optionalUuid(input.operationId, "OperationId", "operationId"),
-        taskId: optionalUuid(input.taskId, "TaskId", "taskId"),
-        agentRunId: optionalUuid(input.agentRunId, "AgentRunId", "agentRunId"),
+        workspaceId: principal.workspaceId,
+        projectId: ["project", "task", "run"].includes(String(input.scopeType)) ? principal.projectId : null,
+        operationId: ["operation", "task", "run"].includes(String(input.scopeType)) ? principal.operationId : null,
+        taskId: ["task", "run"].includes(String(input.scopeType)) ? principal.taskId : null,
+        agentRunId: input.scopeType === "run" ? principal.agentRunId : null,
         kind: "fact",
         title: requiredString(input.title, "title"),
         body: requiredString(input.body, "body"),
@@ -49,9 +54,9 @@ export async function handleMemoryTool(memory: MemoryService, name: string, args
       }));
     case "decision.record":
       return text(await memory.recordDecision({
-        workspaceId: asId<"WorkspaceId">(requiredString(input.workspaceId, "workspaceId"), "workspaceId"),
-        projectId: optionalUuid(input.projectId, "ProjectId", "projectId"),
-        operationId: optionalUuid(input.operationId, "OperationId", "operationId"),
+        workspaceId: principal.workspaceId,
+        projectId: principal.projectId,
+        operationId: principal.operationId,
         title: requiredString(input.title, "title"),
         decision: requiredString(input.decision, "decision"),
         reason: requiredString(input.reason, "reason"),
@@ -59,11 +64,12 @@ export async function handleMemoryTool(memory: MemoryService, name: string, args
         supersedesId: optionalUuid(input.supersedesId, "DecisionId", "supersedesId"),
       }));
     case "finding.record":
+      if (!principal.projectId) throw new DomainError("FORBIDDEN", "Finding requires project scope");
       return text(await memory.recordFinding({
-        workspaceId: asId<"WorkspaceId">(requiredString(input.workspaceId, "workspaceId"), "workspaceId"),
-        projectId: asId<"ProjectId">(requiredString(input.projectId, "projectId"), "projectId"),
-        taskId: optionalUuid(input.taskId, "TaskId", "taskId"),
-        agentRunId: optionalUuid(input.agentRunId, "AgentRunId", "agentRunId"),
+        workspaceId: principal.workspaceId,
+        projectId: principal.projectId,
+        taskId: principal.taskId,
+        agentRunId: principal.agentRunId,
         title: requiredString(input.title, "title"),
         body: requiredString(input.body, "body"),
         recommendation: typeof input.recommendation === "string" ? input.recommendation : null,

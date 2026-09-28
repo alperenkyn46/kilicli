@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "runtime_handoffs_one_active_predecessor_uq" ON "runtime_handoffs" USING btree ("predecessor_session_id") WHERE "runtime_handoffs"."status" in ('requested','checkpointed','successor_planned','successor_ready');

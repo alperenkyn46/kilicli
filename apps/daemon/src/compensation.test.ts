@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Clock } from "@kilic/shared";
 import { createInMemoryRepositories, seedFoundationCatalog } from "@kilic/db";
-import { ExecutionControl, Kernel } from "@kilic/kernel";
+import { EffectAuthorization, ExecutionControl, Kernel } from "@kilic/kernel";
 import { createSilentLogger } from "@kilic/observability";
 import { ExecutionPlane } from "./execution.js";
 import type { GitWorktreeManager } from "./worktree.js";
@@ -18,6 +18,17 @@ class MemoryRuntime {
   failOpen = false;
   live = new Set<string>();
   closed: string[] = [];
+
+  capabilities() {
+    return { supportsSessionResume: true, supportsTurnPauseResume: true, supportsToolInterception: true,
+      supportsPreCompactionSignal: false, supportsSessionEndSignal: false, supportsStreaming: true, supportsInterrupt: true };
+  }
+
+  async sessionHealth(input: { adapterSessionId: string }): Promise<"alive" | "dead"> {
+    return this.live.has(input.adapterSessionId) ? "alive" : "dead";
+  }
+
+  async resumeSession(): Promise<void> {}
 
   async status(): Promise<"AVAILABLE"> {
     return "AVAILABLE";
@@ -37,6 +48,14 @@ class MemoryRuntime {
   async close(input: { adapterSessionId: string }): Promise<void> {
     this.live.delete(input.adapterSessionId);
     this.closed.push(input.adapterSessionId);
+  }
+
+  async interrupt(): Promise<void> {}
+  async resolveEffect(): Promise<void> {}
+
+  async *send(): AsyncIterable<{ type: "started" | "completed" }> {
+    yield { type: "started" };
+    yield { type: "completed" };
   }
 }
 
@@ -78,9 +97,9 @@ describe("materialize compensation", () => {
     expect(ctx.trees.removed).toHaveLength(1);
 
     const retried = ctx.rebuild();
-    const result = await retried.plane.materialize({ runId: ctx.runId, repositoryId: ctx.repositoryId });
+    const result = await retried.plane.materialize({ runId: ctx.runId, repositoryId: ctx.repositoryId, retry: true });
     expect(result.cwd).toContain(ctx.runId);
-    expect((await retried.control.getRun(ctx.runId)).status).toBe("running");
+    expect((await retried.control.getRun(ctx.runId)).status).toBe("planned");
     expect((await retried.control.getSession(ctx.sessionId)).status).toBe("active");
     expect((await retried.control.getSession(ctx.sessionId)).executionEpoch).toBe("boot");
   });
@@ -133,13 +152,16 @@ async function setup() {
   if (dispatched.status !== "planned") throw new Error(dispatched.status);
   const trees = new MemoryTrees();
   const build = (activeRuntime: MemoryRuntime) => {
-    const control = new ExecutionControl(repos, clock);
+    const control = new ExecutionControl(repos, clock, "Test doctrine");
     const plane = new ExecutionPlane({
       control,
       runtime: activeRuntime,
+      effects: new EffectAuthorization(repos, clock),
+      handoffPlanner: kernel,
       worktrees: trees as unknown as GitWorktreeManager,
       worktreeRoot: "/tmp/worktrees",
       bootId: "boot",
+      nodeId: node.id,
     });
     return { control, plane };
   };

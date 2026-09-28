@@ -26,3 +26,6 @@ Foundation kararları. `KILIC_ARCHITECTURE.md` ile çelişen yerler ilgili ADR'd
 | [0020](0020-memory-scopes.md) | Memory scope |
 | [0021](0021-http-edge-hono.md) | HTTP kenarı |
 | [0022](0022-canonical-user-flow.md) | Kullanıcı akışı |
+| [0023](0023-execution-jobs-and-durable-handoff.md) | Execution job, effect authorization ve handoff |
+| [0024](0024-execution-digests-and-bounded-context.md) | Execution digest ve bounded bootstrap |
+| [0025](0025-runtime-mediation-and-continuity.md) | Brokered effect, approval continuation ve lifecycle flush |

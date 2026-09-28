@@ -19,6 +19,7 @@ import {
   ACCESS_MODES,
   AGENT_RUN_KINDS,
   AGENT_RUN_STATUSES,
+  EXECUTION_JOB_STATUSES,
   APPROVAL_STATUSES,
   CHECKOUT_STATUSES,
   CHECKPOINT_TRIGGERS,
@@ -37,10 +38,13 @@ import {
   RECORD_STATUSES,
   RUNTIME_SESSION_PURPOSES,
   RUNTIME_SESSION_STATUSES,
+  RUNTIME_HANDOFF_STATUSES,
+  DIGEST_INGESTION_STATUSES,
   TASK_STATUSES,
   WORKTREE_STATUSES,
   type CheckpointState,
   type IsolationPlan,
+  type DigestIngestion,
 } from "@kilic/domain";
 
 function oneOf(column: AnyPgColumn, values: readonly string[], name: string) {
@@ -216,6 +220,7 @@ export const orchestrators = pgTable(
       .on(table.projectId)
       .where(sql`${table.kind} = 'project'`),
     unique("orchestrators_id_workspace_uq").on(table.id, table.workspaceId),
+    unique("orchestrators_id_project_workspace_uq").on(table.id, table.projectId, table.workspaceId),
   ],
 );
 
@@ -268,6 +273,8 @@ export const tasks = pgTable(
     unique("tasks_id_workspace_uq").on(table.id, table.workspaceId),
     unique("tasks_id_operation_uq").on(table.id, table.operationId),
     unique("tasks_scope_uq").on(table.id, table.operationId, table.projectId, table.workspaceId),
+    unique("tasks_project_scope_uq").on(table.id, table.projectId, table.workspaceId),
+    unique("tasks_orchestrator_scope_uq").on(table.id, table.orchestratorId, table.operationId, table.projectId, table.workspaceId),
     foreignKey({
       columns: [table.operationId, table.workspaceId],
       foreignColumns: [operations.id, operations.workspaceId],
@@ -277,6 +284,11 @@ export const tasks = pgTable(
       columns: [table.projectId, table.workspaceId],
       foreignColumns: [projects.id, projects.workspaceId],
       name: "tasks_project_workspace_fk",
+    }),
+    foreignKey({
+      columns: [table.orchestratorId, table.projectId, table.workspaceId],
+      foreignColumns: [orchestrators.id, orchestrators.projectId, orchestrators.workspaceId],
+      name: "tasks_project_orchestrator_fk",
     }),
   ],
 );
@@ -353,6 +365,8 @@ export const routingPolicies = pgTable(
         EXECUTION_PROFILES.map((value) => `'${value}'`).join(", "),
       )})`,
     ),
+    foreignKey({ columns: [table.projectId, table.workspaceId], foreignColumns: [projects.id, projects.workspaceId], name: "routing_policies_project_workspace_fk" }),
+    foreignKey({ columns: [table.operationId, table.workspaceId], foreignColumns: [operations.id, operations.workspaceId], name: "routing_policies_operation_workspace_fk" }),
   ],
 );
 
@@ -406,6 +420,7 @@ export const runtimeSessions = pgTable(
     oneOf(table.purpose, RUNTIME_SESSION_PURPOSES, "runtime_sessions_purpose_ck"),
     oneOf(table.status, RUNTIME_SESSION_STATUSES, "runtime_sessions_status_ck"),
     unique("runtime_sessions_id_orchestrator_uq").on(table.id, table.orchestratorId),
+    unique("runtime_sessions_id_orchestrator_node_uq").on(table.id, table.orchestratorId, table.executionNodeId),
   ],
 );
 
@@ -438,7 +453,10 @@ export const agentRuns = pgTable(
     oneOf(table.kind, AGENT_RUN_KINDS, "agent_runs_kind_ck"),
     oneOf(table.status, AGENT_RUN_STATUSES, "agent_runs_status_ck"),
     oneOf(table.access, ACCESS_MODES, "agent_runs_access_ck"),
+    check("agent_runs_worker_scope_ck", sql`${table.kind} <> 'worker' OR (${table.taskId} IS NOT NULL AND ${table.operationId} IS NOT NULL AND ${table.projectId} IS NOT NULL AND ${table.runtimeSessionId} IS NOT NULL)`),
     unique("agent_runs_id_workspace_uq").on(table.id, table.workspaceId),
+    unique("agent_runs_id_project_workspace_uq").on(table.id, table.projectId, table.workspaceId),
+    unique("agent_runs_id_task_project_workspace_uq").on(table.id, table.taskId, table.projectId, table.workspaceId),
     foreignKey({
       columns: [table.projectId, table.workspaceId],
       foreignColumns: [projects.id, projects.workspaceId],
@@ -449,6 +467,9 @@ export const agentRuns = pgTable(
       foreignColumns: [operations.id, operations.workspaceId],
       name: "agent_runs_operation_workspace_fk",
     }),
+    foreignKey({ columns: [table.orchestratorId, table.workspaceId], foreignColumns: [orchestrators.id, orchestrators.workspaceId], name: "agent_runs_orchestrator_workspace_fk" }),
+    foreignKey({ columns: [table.runtimeSessionId, table.orchestratorId], foreignColumns: [runtimeSessions.id, runtimeSessions.orchestratorId], name: "agent_runs_session_orchestrator_fk" }),
+    foreignKey({ columns: [table.taskId, table.orchestratorId, table.operationId, table.projectId, table.workspaceId], foreignColumns: [tasks.id, tasks.orchestratorId, tasks.operationId, tasks.projectId, tasks.workspaceId], name: "agent_runs_task_scope_fk" }),
   ],
 );
 
@@ -577,6 +598,10 @@ export const findings = pgTable(
       foreignColumns: [projects.id, projects.workspaceId],
       name: "findings_project_workspace_fk",
     }),
+    foreignKey({ columns: [table.taskId, table.projectId, table.workspaceId], foreignColumns: [tasks.id, tasks.projectId, tasks.workspaceId], name: "findings_task_project_fk" }),
+    foreignKey({ columns: [table.agentRunId, table.workspaceId], foreignColumns: [agentRuns.id, agentRuns.workspaceId], name: "findings_run_workspace_fk" }),
+    foreignKey({ columns: [table.agentRunId, table.projectId, table.workspaceId], foreignColumns: [agentRuns.id, agentRuns.projectId, agentRuns.workspaceId], name: "findings_run_project_fk" }),
+    foreignKey({ columns: [table.agentRunId, table.taskId, table.projectId, table.workspaceId], foreignColumns: [agentRuns.id, agentRuns.taskId, agentRuns.projectId, agentRuns.workspaceId], name: "findings_run_task_fk" }),
   ],
 );
 
@@ -600,6 +625,7 @@ export const checkpoints = pgTable(
   },
   (table) => [
     oneOf(table.trigger, CHECKPOINT_TRIGGERS, "checkpoints_trigger_ck"),
+    unique("checkpoints_handoff_scope_uq").on(table.id, table.runtimeSessionId, table.orchestratorId, table.workspaceId),
     check("checkpoints_task_requires_operation_ck", sql`${table.taskId} is null or ${table.operationId} is not null`),
     foreignKey({
       columns: [table.orchestratorId, table.workspaceId],
@@ -665,7 +691,13 @@ export const artifacts = pgTable("artifacts", {
   mediaType: text("media_type"),
   metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull(),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull(),
-});
+}, (table) => [
+  foreignKey({ columns: [table.projectId, table.workspaceId], foreignColumns: [projects.id, projects.workspaceId], name: "artifacts_project_workspace_fk" }),
+  foreignKey({ columns: [table.taskId, table.projectId, table.workspaceId], foreignColumns: [tasks.id, tasks.projectId, tasks.workspaceId], name: "artifacts_task_project_fk" }),
+  foreignKey({ columns: [table.agentRunId, table.workspaceId], foreignColumns: [agentRuns.id, agentRuns.workspaceId], name: "artifacts_run_workspace_fk" }),
+  foreignKey({ columns: [table.agentRunId, table.projectId, table.workspaceId], foreignColumns: [agentRuns.id, agentRuns.projectId, agentRuns.workspaceId], name: "artifacts_run_project_fk" }),
+  foreignKey({ columns: [table.agentRunId, table.taskId, table.projectId, table.workspaceId], foreignColumns: [agentRuns.id, agentRuns.taskId, agentRuns.projectId, agentRuns.workspaceId], name: "artifacts_run_task_fk" }),
+]);
 
 export const policyRules = pgTable(
   "policy_rules",
@@ -713,6 +745,7 @@ export const approvals = pgTable(
   },
   (table) => [
     oneOf(table.status, APPROVAL_STATUSES, "approvals_status_ck"),
+    unique("approvals_id_workspace_uq").on(table.id, table.workspaceId),
     foreignKey({
       columns: [table.projectId, table.workspaceId],
       foreignColumns: [projects.id, projects.workspaceId],
@@ -742,4 +775,149 @@ export const worktrees = pgTable(
     removedAt: timestamp("removed_at", { withTimezone: true, mode: "date" }),
   },
   (table) => [oneOf(table.status, WORKTREE_STATUSES, "worktrees_status_ck")],
+);
+
+export const executionJobs = pgTable(
+  "execution_jobs",
+  {
+    id: uuid("id").primaryKey(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    requestFingerprint: text("request_fingerprint").notNull(),
+    runtimeSessionId: uuid("runtime_session_id").notNull().references(() => runtimeSessions.id),
+    agentRunId: uuid("agent_run_id").references(() => agentRuns.id),
+    orchestratorId: uuid("orchestrator_id").notNull().references(() => orchestrators.id),
+    executionNodeId: uuid("execution_node_id").notNull().references(() => executionNodes.id),
+    workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+    projectId: uuid("project_id").references(() => projects.id),
+    operationId: uuid("operation_id").references(() => operations.id),
+    taskId: uuid("task_id").references(() => tasks.id),
+    repositoryId: uuid("repository_id").references(() => repositories.id),
+    correlationId: uuid("correlation_id").notNull(),
+    causationId: uuid("causation_id").references(() => events.id),
+    handoffCheckpointId: uuid("handoff_checkpoint_id").references(() => checkpoints.id),
+    pendingApprovalId: uuid("pending_approval_id").references(() => approvals.id),
+    status: text("status").notNull(),
+    claimEpoch: text("claim_epoch"),
+    leaseUntil: timestamp("lease_until", { withTimezone: true, mode: "date" }),
+    startedAt: timestamp("started_at", { withTimezone: true, mode: "date" }),
+    endedAt: timestamp("ended_at", { withTimezone: true, mode: "date" }),
+    outcome: text("outcome"),
+    ...timestamps,
+  },
+  (table) => [
+    unique("execution_jobs_idempotency_uq").on(table.workspaceId, table.idempotencyKey),
+    unique("execution_jobs_agent_run_uq").on(table.agentRunId),
+    unique("execution_jobs_digest_scope_uq").on(table.id, table.runtimeSessionId, table.workspaceId),
+    oneOf(table.status, EXECUTION_JOB_STATUSES, "execution_jobs_status_ck"),
+    check("execution_jobs_claim_ck", sql`(${table.status} = 'planned' AND ${table.claimEpoch} IS NULL) OR (${table.status} <> 'planned' AND ${table.claimEpoch} IS NOT NULL)`),
+    check("execution_jobs_approval_ck", sql`${table.status} <> 'awaiting_approval' OR ${table.pendingApprovalId} IS NOT NULL`),
+    foreignKey({ columns: [table.orchestratorId, table.workspaceId], foreignColumns: [orchestrators.id, orchestrators.workspaceId], name: "execution_jobs_orchestrator_scope_fk" }),
+    foreignKey({ columns: [table.runtimeSessionId, table.orchestratorId, table.executionNodeId], foreignColumns: [runtimeSessions.id, runtimeSessions.orchestratorId, runtimeSessions.executionNodeId], name: "execution_jobs_session_scope_fk" }),
+    foreignKey({ columns: [table.projectId, table.workspaceId], foreignColumns: [projects.id, projects.workspaceId], name: "execution_jobs_project_scope_fk" }),
+    foreignKey({ columns: [table.operationId, table.workspaceId], foreignColumns: [operations.id, operations.workspaceId], name: "execution_jobs_operation_scope_fk" }),
+    foreignKey({ columns: [table.pendingApprovalId, table.workspaceId], foreignColumns: [approvals.id, approvals.workspaceId], name: "execution_jobs_approval_workspace_fk" }),
+    foreignKey({ columns: [table.taskId, table.orchestratorId, table.operationId, table.projectId, table.workspaceId], foreignColumns: [tasks.id, tasks.orchestratorId, tasks.operationId, tasks.projectId, tasks.workspaceId], name: "execution_jobs_task_scope_fk" }),
+  ],
+);
+
+export const executionDigests = pgTable(
+  "execution_digests",
+  {
+    id: uuid("id").primaryKey(),
+    executionJobId: uuid("execution_job_id").notNull().references(() => executionJobs.id),
+    runtimeSessionId: uuid("runtime_session_id").notNull().references(() => runtimeSessions.id),
+    agentRunId: uuid("agent_run_id").references(() => agentRuns.id),
+    workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+    projectId: uuid("project_id").references(() => projects.id),
+    operationId: uuid("operation_id").references(() => operations.id),
+    taskId: uuid("task_id").references(() => tasks.id),
+    sourceDigest: text("source_digest").notNull(),
+    sourceCursor: text("source_cursor"),
+    summary: text("summary").notNull(),
+    observedDecisions: jsonb("observed_decisions").$type<string[]>().notNull(),
+    observedFindings: jsonb("observed_findings").$type<string[]>().notNull(),
+    touchedArtifacts: jsonb("touched_artifacts").$type<string[]>().notNull(),
+    verificationResult: text("verification_result"),
+    openQuestions: jsonb("open_questions").$type<string[]>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull(),
+  },
+  (table) => [
+    unique("execution_digests_source_uq").on(table.executionJobId, table.sourceDigest),
+    unique("execution_digests_session_workspace_uq").on(table.id, table.runtimeSessionId, table.workspaceId),
+    foreignKey({ columns: [table.executionJobId, table.runtimeSessionId, table.workspaceId], foreignColumns: [executionJobs.id, executionJobs.runtimeSessionId, executionJobs.workspaceId], name: "execution_digests_job_scope_fk" }),
+  ],
+);
+
+export const effectGrants = pgTable(
+  "effect_grants",
+  {
+    id: uuid("id").primaryKey(),
+    principalKey: text("principal_key").notNull(),
+    executionJobId: uuid("execution_job_id").notNull().references(() => executionJobs.id),
+    agentRunId: uuid("agent_run_id").references(() => agentRuns.id),
+    action: text("action").notNull(),
+    resource: text("resource").notNull(),
+    requestKey: text("request_key").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true, mode: "date" }).notNull(),
+    consumedAt: timestamp("consumed_at", { withTimezone: true, mode: "date" }),
+    createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull(),
+  },
+  (table) => [unique("effect_grants_request_uq").on(table.executionJobId, table.requestKey)],
+);
+
+export const runtimeHandoffs = pgTable(
+  "runtime_handoffs",
+  {
+    id: uuid("id").primaryKey(),
+    predecessorSessionId: uuid("predecessor_session_id").notNull().references(() => runtimeSessions.id),
+    successorSessionId: uuid("successor_session_id").references(() => runtimeSessions.id),
+    orchestratorId: uuid("orchestrator_id").notNull().references(() => orchestrators.id),
+    workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+    operationId: uuid("operation_id").references(() => operations.id),
+    taskId: uuid("task_id").references(() => tasks.id),
+    checkpointId: uuid("checkpoint_id").references(() => checkpoints.id),
+    digestId: uuid("digest_id").references(() => executionDigests.id),
+    repositoryState: jsonb("repository_state").$type<Record<string, unknown>>().notNull(),
+    reason: text("reason").notNull(),
+    status: text("status").notNull(),
+    correlationId: uuid("correlation_id").notNull(),
+    causationId: uuid("causation_id").references(() => events.id),
+    ...timestamps,
+  },
+  (table) => [
+    oneOf(table.status, RUNTIME_HANDOFF_STATUSES, "runtime_handoffs_status_ck"),
+    check("runtime_handoffs_scope_ck", sql`${table.taskId} is null or ${table.operationId} is not null`),
+    check("runtime_handoffs_progress_ck", sql`(${table.status} = 'requested') or (${table.checkpointId} is not null and (${table.status} = 'checkpointed' or ${table.successorSessionId} is not null))`),
+    uniqueIndex("runtime_handoffs_one_active_predecessor_uq").on(table.predecessorSessionId)
+      .where(sql`${table.status} in ('requested','checkpointed','successor_planned','successor_ready')`),
+    foreignKey({ columns: [table.predecessorSessionId, table.orchestratorId], foreignColumns: [runtimeSessions.id, runtimeSessions.orchestratorId], name: "runtime_handoffs_predecessor_scope_fk" }),
+    foreignKey({ columns: [table.successorSessionId, table.orchestratorId], foreignColumns: [runtimeSessions.id, runtimeSessions.orchestratorId], name: "runtime_handoffs_successor_scope_fk" }),
+    foreignKey({ columns: [table.orchestratorId, table.workspaceId], foreignColumns: [orchestrators.id, orchestrators.workspaceId], name: "runtime_handoffs_orchestrator_scope_fk" }),
+    foreignKey({ columns: [table.operationId, table.workspaceId], foreignColumns: [operations.id, operations.workspaceId], name: "runtime_handoffs_operation_scope_fk" }),
+    foreignKey({ columns: [table.taskId, table.operationId], foreignColumns: [tasks.id, tasks.operationId], name: "runtime_handoffs_task_scope_fk" }),
+    foreignKey({ columns: [table.checkpointId, table.predecessorSessionId, table.orchestratorId, table.workspaceId], foreignColumns: [checkpoints.id, checkpoints.runtimeSessionId, checkpoints.orchestratorId, checkpoints.workspaceId], name: "runtime_handoffs_checkpoint_scope_fk" }),
+    foreignKey({ columns: [table.digestId, table.predecessorSessionId, table.workspaceId], foreignColumns: [executionDigests.id, executionDigests.runtimeSessionId, executionDigests.workspaceId], name: "runtime_handoffs_digest_scope_fk" }),
+  ],
+);
+
+export const digestIngestions = pgTable(
+  "digest_ingestions",
+  {
+    id: uuid("id").primaryKey(),
+    executionJobId: uuid("execution_job_id").notNull().references(() => executionJobs.id),
+    sourceDigest: text("source_digest").notNull(),
+    sourceCursor: text("source_cursor"),
+    payload: jsonb("payload").$type<DigestIngestion["payload"]>().notNull(),
+    status: text("status").notNull(),
+    attempts: integer("attempts").notNull(),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true, mode: "date" }).notNull(),
+    lastError: text("last_error"),
+    digestId: uuid("digest_id").references(() => executionDigests.id),
+    ...timestamps,
+  },
+  (table) => [
+    unique("digest_ingestions_source_uq").on(table.executionJobId, table.sourceDigest),
+    oneOf(table.status, DIGEST_INGESTION_STATUSES, "digest_ingestions_status_ck"),
+    index("digest_ingestions_due_idx").on(table.status, table.nextAttemptAt),
+  ],
 );

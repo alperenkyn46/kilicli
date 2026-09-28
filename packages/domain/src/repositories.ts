@@ -1,5 +1,10 @@
 import type {
   AgentRun,
+  ExecutionJob,
+  ExecutionDigest,
+  EffectGrant,
+  RuntimeHandoff,
+  DigestIngestion,
   Approval,
   Artifact,
   Checkpoint,
@@ -29,6 +34,11 @@ import type {
 } from "./entities.js";
 import type {
   AgentRunId,
+  ExecutionJobId,
+  ExecutionDigestId,
+  EffectGrantId,
+  RuntimeHandoffId,
+  DigestIngestionId,
   ApprovalId,
   ArtifactId,
   CheckpointId,
@@ -57,6 +67,8 @@ import type {
 } from "./ids.js";
 import type {
   AgentRunStatus,
+  ExecutionJobStatus,
+  RuntimeHandoffStatus,
   ApprovalStatus,
   OperationStatus,
   OrchestratorKind,
@@ -75,6 +87,7 @@ export type MemorySearchQuery = {
   taskId?: TaskId;
   agentRunId?: AgentRunId;
   text?: string;
+  limit?: number;
 };
 
 /**
@@ -123,6 +136,7 @@ export interface Repositories {
     insert(checkout: RepositoryCheckout): Promise<void>;
     get(id: RepositoryCheckoutId): Promise<RepositoryCheckout | null>;
     find(repositoryId: RepositoryId, executionNodeId: ExecutionNodeId): Promise<RepositoryCheckout | null>;
+    listByNode(executionNodeId: ExecutionNodeId): Promise<RepositoryCheckout[]>;
   };
 
   projectRelations: {
@@ -146,6 +160,7 @@ export interface Repositories {
     insert(operation: Operation): Promise<void>;
     get(id: OperationId): Promise<Operation | null>;
     setStatus(id: OperationId, status: OperationStatus, updatedAt: Date): Promise<void>;
+    transition(id: OperationId, from: OperationStatus, to: OperationStatus, updatedAt: Date): Promise<boolean>;
   };
 
   tasks: {
@@ -153,6 +168,7 @@ export interface Repositories {
     get(id: TaskId): Promise<Task | null>;
     listByOperation(operationId: OperationId): Promise<Task[]>;
     setStatus(id: TaskId, status: TaskStatus, updatedAt: Date): Promise<void>;
+    transition(id: TaskId, from: TaskStatus, to: TaskStatus, updatedAt: Date): Promise<boolean>;
   };
 
   taskDependencies: {
@@ -205,7 +221,8 @@ export interface Repositories {
         updatedAt: Date;
       },
     ): Promise<void>;
-    attachAdapter(id: RuntimeSessionId, adapterSessionId: string, executionEpoch: string, updatedAt: Date): Promise<void>;
+    transition(id: RuntimeSessionId, from: RuntimeSessionStatus, patch: { status: RuntimeSessionStatus; closeReason: string | null; endedAt: Date | null; updatedAt: Date }): Promise<boolean>;
+    attachAdapter(id: RuntimeSessionId, adapterSessionId: string, executionEpoch: string, updatedAt: Date): Promise<boolean>;
     rearm(id: RuntimeSessionId, updatedAt: Date): Promise<void>;
   };
 
@@ -214,8 +231,50 @@ export interface Repositories {
     get(id: AgentRunId): Promise<AgentRun | null>;
     listBySession(sessionId: RuntimeSessionId): Promise<AgentRun[]>;
     setStatus(id: AgentRunId, status: AgentRunStatus, updatedAt: Date, endedAt: Date | null): Promise<void>;
+    transition(id: AgentRunId, from: AgentRunStatus, to: AgentRunStatus, updatedAt: Date, endedAt: Date | null): Promise<boolean>;
     rearm(id: AgentRunId, updatedAt: Date): Promise<void>;
     attachSession(id: AgentRunId, runtimeSessionId: RuntimeSessionId, updatedAt: Date): Promise<void>;
+  };
+
+  executionJobs: {
+    insert(job: ExecutionJob): Promise<ExecutionJob>;
+    get(id: ExecutionJobId): Promise<ExecutionJob | null>;
+    getByIdempotencyKey(workspaceId: WorkspaceId, key: string): Promise<ExecutionJob | null>;
+    getByRun(runId: AgentRunId): Promise<ExecutionJob | null>;
+    listByNode(nodeId: ExecutionNodeId): Promise<ExecutionJob[]>;
+    claim(id: ExecutionJobId, nodeId: ExecutionNodeId, epoch: string, leaseUntil: Date, now: Date): Promise<boolean>;
+    renew(id: ExecutionJobId, nodeId: ExecutionNodeId, epoch: string, leaseUntil: Date, now: Date): Promise<boolean>;
+    transition(id: ExecutionJobId, from: ExecutionJobStatus, to: ExecutionJobStatus, patch: Partial<Pick<ExecutionJob, "startedAt" | "endedAt" | "outcome" | "leaseUntil" | "claimEpoch" | "pendingApprovalId">>, now: Date): Promise<boolean>;
+  };
+
+  executionDigests: {
+    insert(digest: ExecutionDigest): Promise<ExecutionDigest>;
+    get(id: ExecutionDigestId): Promise<ExecutionDigest | null>;
+    getBySource(executionJobId: ExecutionJobId, sourceDigest: string): Promise<ExecutionDigest | null>;
+  };
+
+  effectGrants: {
+    insert(grant: EffectGrant): Promise<EffectGrant>;
+    get(id: EffectGrantId): Promise<EffectGrant | null>;
+    getByRequest(executionJobId: ExecutionJobId, requestKey: string): Promise<EffectGrant | null>;
+    consume(id: EffectGrantId, now: Date): Promise<boolean>;
+  };
+
+  runtimeHandoffs: {
+    insert(handoff: RuntimeHandoff): Promise<void>;
+    get(id: RuntimeHandoffId): Promise<RuntimeHandoff | null>;
+    listByNode(nodeId: ExecutionNodeId): Promise<RuntimeHandoff[]>;
+    latestForPredecessor(sessionId: RuntimeSessionId): Promise<RuntimeHandoff | null>;
+    findBySuccessor(sessionId: RuntimeSessionId): Promise<RuntimeHandoff | null>;
+    transition(id: RuntimeHandoffId, from: RuntimeHandoffStatus, to: RuntimeHandoffStatus, patch: Partial<Pick<RuntimeHandoff, "successorSessionId" | "checkpointId" | "digestId">>, now: Date): Promise<boolean>;
+  };
+
+  digestIngestions: {
+    enqueue(item: DigestIngestion): Promise<DigestIngestion>;
+    get(id: DigestIngestionId): Promise<DigestIngestion | null>;
+    claimDue(now: Date): Promise<DigestIngestion | null>;
+    complete(id: DigestIngestionId, digestId: ExecutionDigestId, attempts: number, now: Date): Promise<void>;
+    retry(id: DigestIngestionId, error: string, nextAttemptAt: Date, attempts: number, now: Date): Promise<void>;
   };
 
   memoryItems: {
@@ -240,6 +299,7 @@ export interface Repositories {
     insert(checkpoint: Checkpoint): Promise<void>;
     get(id: CheckpointId): Promise<Checkpoint | null>;
     latestForOrchestrator(orchestratorId: OrchestratorId): Promise<Checkpoint | null>;
+    latestRelevant(orchestratorId: OrchestratorId, operationId: OperationId | null, taskId: TaskId | null): Promise<Checkpoint | null>;
   };
 
   events: {
@@ -264,12 +324,15 @@ export interface Repositories {
   approvals: {
     insert(approval: Approval): Promise<void>;
     get(id: ApprovalId): Promise<Approval | null>;
+    findEffectRequest(executionJobId: ExecutionJobId, requestKey: string): Promise<Approval | null>;
     decide(id: ApprovalId, status: Exclude<ApprovalStatus, "pending">, decidedAt: Date): Promise<void>;
   };
 
   worktrees: {
     insert(worktree: Worktree): Promise<void>;
     get(id: WorktreeId): Promise<Worktree | null>;
+    listByNode(executionNodeId: ExecutionNodeId): Promise<Worktree[]>;
+    findActiveByRun(agentRunId: AgentRunId): Promise<Worktree | null>;
     markRemoved(id: WorktreeId, removedAt: Date): Promise<void>;
   };
 }

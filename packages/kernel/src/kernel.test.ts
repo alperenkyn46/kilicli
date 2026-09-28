@@ -79,6 +79,7 @@ describe("foundation control plane", () => {
       action: "file_write",
       executionNodeId: node.id,
       baseRef: "main",
+      idempotencyKey: "worker-task-request-1",
     });
     expect(planned.status).toBe("planned");
     if (planned.status === "planned") {
@@ -86,6 +87,13 @@ describe("foundation control plane", () => {
       expect(planned.session.orchestratorId).toBe(projectOrchestrator.id);
       expect(planned.session.purpose).toBe("worker");
       expect(planned.session.status).toBe("starting");
+      const repeated = await kernel.dispatchWorker({ taskId: task.id, role: "worker", access: "write",
+        action: "file_write", executionNodeId: node.id, baseRef: "main", idempotencyKey: "worker-task-request-1" });
+      expect(repeated.status).toBe("existing");
+      if (repeated.status === "existing") {
+        expect(repeated.run.id).toBe(planned.run.id);
+        expect(repeated.session.id).toBe(planned.session.id);
+      }
     }
 
     const approval = await kernel.dispatchWorker({
@@ -148,18 +156,21 @@ describe("foundation control plane", () => {
     });
     expect(reused.action).toBe("resume");
     expect(reused.session.id).toBe(opened.session.id);
+    const firstTurn = await kernel.planMindTurn({ sessionId: opened.session.id,
+      idempotencyKey: "mind-turn-1", textDigest: "digest-a", operationId: operation.id });
+    const replayedTurn = await kernel.planMindTurn({ sessionId: opened.session.id,
+      idempotencyKey: "mind-turn-1", textDigest: "digest-a", operationId: operation.id });
+    expect(replayedTurn.id).toBe(firstTurn.id);
+    await expect(kernel.planMindTurn({ sessionId: opened.session.id,
+      idempotencyKey: "mind-turn-1", textDigest: "digest-b", operationId: operation.id })).rejects.toThrow(/changed meaning/);
 
-    const reconstructed = await kernel.planMindSession({
+    await expect(kernel.planMindSession({
       orchestratorId: workspaceOrchestrator.id,
       executionNodeId: node.id,
       contextHealth: "degraded",
       explicitSwitch: false,
       operationId: operation.id,
-    });
-    expect(reconstructed.action).toBe("open");
-    if (reconstructed.action !== "open") return;
-    expect(reconstructed.reason).toBe("context_degraded");
-    expect(reconstructed.closePreviousSessionId).toBe(opened.session.id);
+    })).rejects.toThrow(/Durable handoff checkpoint/);
     expect((await repos.runtimeSessions.get(opened.session.id))?.status).toBe("active");
 
     const checkpoint = await kernel.recordCheckpoint({

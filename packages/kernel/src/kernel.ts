@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import { DomainError, newId, type Clock } from "@kilic/shared";
 import type { Logger } from "@kilic/observability";
-import type { RuntimeStatus } from "@kilic/runtime-contract";
+import type { RuntimeStatus, RuntimeLifecycleSignal, RuntimeCheckpointState, RuntimeDigestSource } from "@kilic/runtime-contract";
 import {
   assertConfidence,
   assertNoDependencyCycle,
@@ -19,9 +20,16 @@ import {
   taskStatusAfterDependencies,
   type AccessMode,
   type AgentRun,
+  type ExecutionJob,
+  type ExecutionJobId,
+  type RuntimeHandoff,
+  type RuntimeHandoffId,
+  type ExecutionDigestId,
+  type EventId,
   type Approval,
   type ApprovalStatus,
   type Checkpoint,
+  type CheckpointId,
   type CheckpointState,
   type CheckpointTrigger,
   type ContextHealth,
@@ -45,6 +53,7 @@ import {
   type Task,
   type TaskStatus,
   type User,
+  type Principal,
   type Workspace,
   type AgentRunId,
   type ApprovalId,
@@ -73,7 +82,8 @@ export type KernelDeps = {
 };
 
 export type DispatchResult =
-  | { status: "planned"; run: AgentRun; session: RuntimeSession; route: RouteCandidate }
+  | { status: "planned"; run: AgentRun; session: RuntimeSession; route: RouteCandidate; job: ExecutionJob }
+  | { status: "existing"; run: AgentRun; session: RuntimeSession; job: ExecutionJob }
   | { status: "approval_required"; approval: Approval }
   | { status: "no_route"; reason: "no_matching_policy" | "no_available_harness" };
 
@@ -83,6 +93,57 @@ export type MindPlan =
 
 export class Kernel {
   constructor(private readonly deps: KernelDeps) {}
+
+  async authorizeWorkspace(principal: Principal, workspaceId: WorkspaceId): Promise<void> {
+    if (principal.kind === "service") return;
+    if (principal.kind === "tool") {
+      if (principal.workspaceId === workspaceId) return;
+      throw new DomainError("FORBIDDEN", "Tool principal is outside the workspace");
+    }
+    if (principal.kind === "execution_node") throw new DomainError("FORBIDDEN", "Execution node cannot administer a workspace");
+    if (!(await this.deps.repos.memberships.get(workspaceId, principal.userId))) throw new DomainError("FORBIDDEN", "User is not a workspace member");
+  }
+
+  async authorizeProject(principal: Principal, projectId: ProjectId): Promise<void> {
+    const project = await this.mustProject(projectId);
+    await this.authorizeWorkspace(principal, project.workspaceId);
+    if (principal.kind === "tool" && principal.projectId !== null && principal.projectId !== projectId) throw new DomainError("FORBIDDEN", "Tool principal is outside the project");
+  }
+
+  async authorizeOperation(principal: Principal, operationId: OperationId): Promise<void> {
+    const operation = await this.mustOperation(operationId);
+    await this.authorizeWorkspace(principal, operation.workspaceId);
+  }
+
+  async authorizeTask(principal: Principal, taskId: TaskId): Promise<void> {
+    const task = await this.mustTask(taskId);
+    await this.authorizeProject(principal, task.projectId);
+    if (principal.kind === "tool" && principal.taskId !== null && principal.taskId !== taskId) throw new DomainError("FORBIDDEN", "Tool principal is outside the task");
+  }
+
+  async authorizeOrchestrator(principal: Principal, orchestratorId: OrchestratorId): Promise<void> {
+    const orchestrator = await this.mustOrchestrator(orchestratorId);
+    await this.authorizeWorkspace(principal, orchestrator.workspaceId);
+    if (orchestrator.projectId) await this.authorizeProject(principal, orchestrator.projectId);
+  }
+
+  async authorizeApproval(principal: Principal, approvalId: ApprovalId): Promise<void> {
+    const approval = await this.mustApproval(approvalId);
+    if (principal.kind !== "user") throw new DomainError("FORBIDDEN", "A user principal must decide an approval");
+    const membership = await this.deps.repos.memberships.get(approval.workspaceId, principal.userId);
+    if (membership?.role !== "owner") throw new DomainError("FORBIDDEN", "Workspace owner approval is required");
+  }
+
+  async authorizeSession(principal: Principal, sessionId: RuntimeSessionId): Promise<void> {
+    const session = await this.mustSession(sessionId);
+    await this.authorizeOrchestrator(principal, session.orchestratorId);
+  }
+
+  async executionNodeForTool(principal: Extract<Principal, { kind: "tool" }>): Promise<ExecutionNodeId> {
+    const job = await this.deps.repos.executionJobs.get(principal.executionJobId);
+    if (!job || job.workspaceId !== principal.workspaceId || job.agentRunId !== principal.agentRunId) throw new DomainError("FORBIDDEN", "Tool principal is not bound to a live execution");
+    return job.executionNodeId;
+  }
 
   async createUser(input: { displayName: string }): Promise<User> {
     const now = this.deps.clock();
@@ -342,7 +403,7 @@ export class Kernel {
     assertOperationTransition(operation.status, status);
     const now = this.deps.clock();
     await this.deps.repos.transaction(async (repos) => {
-      await repos.operations.setStatus(id, status, now);
+      if (!(await repos.operations.transition(id, operation.status, status, now))) throw new DomainError("INVALID_TRANSITION", "Operation changed before transition");
       await this.emit(repos, {
         type: "operation.status_changed",
         workspaceId: operation.workspaceId,
@@ -438,7 +499,7 @@ export class Kernel {
     assertTaskTransition(task.status, status);
     const now = this.deps.clock();
     await this.deps.repos.transaction(async (repos) => {
-      await repos.tasks.setStatus(id, status, now);
+      if (!(await repos.tasks.transition(id, task.status, status, now))) throw new DomainError("INVALID_TRANSITION", "Task changed before transition");
       await this.emit(repos, {
         type: "task.status_changed",
         workspaceId: task.workspaceId,
@@ -476,12 +537,21 @@ export class Kernel {
     baseRef?: string | null;
     profile?: ExecutionProfile | null;
     approvalId?: ApprovalId | null;
+    idempotencyKey?: string;
   }): Promise<DispatchResult> {
     if (input.access === "none") {
       throw new DomainError("INVARIANT", "A worker dispatch needs read_only or write access");
     }
     const task = await this.mustTask(input.taskId);
+    if (task.status !== "ready" && task.status !== "in_progress") {
+      throw new DomainError("INVALID_TRANSITION", `Task ${task.status} cannot be dispatched`);
+    }
     const executionNode = await this.mustExecutionNode(input.executionNodeId);
+    if (executionNode.status !== "online") throw new DomainError("INVARIANT", "Execution node is offline");
+    const idempotencyKey = input.idempotencyKey?.trim() || newId<"DispatchRequestId">();
+    const fingerprint = JSON.stringify({ taskId: input.taskId, role: input.role, access: input.access, action: input.action, executionNodeId: input.executionNodeId, baseRef: input.baseRef ?? null, profile: input.profile ?? null });
+    const existingJob = await this.deps.repos.executionJobs.getByIdempotencyKey(task.workspaceId, idempotencyKey);
+    if (existingJob) return this.existingDispatch(existingJob, fingerprint);
     const decision = await this.evaluateAction({
       action: input.action,
       workspaceId: task.workspaceId,
@@ -589,31 +659,48 @@ export class Kernel {
       createdAt: now,
       updatedAt: now,
     };
+    const taskEvents = await this.deps.repos.events.listByAggregate("task", task.id);
+    const cause = taskEvents.find((event) => event.type === "task.created") ?? null;
+    const dispatchEvent = buildEvent({
+      type: "workforce.dispatch_planned", workspaceId: task.workspaceId, projectId: task.projectId,
+      aggregateType: "agent_run", aggregateId: run.id, correlationId: task.correlationId,
+      causationId: cause?.id ?? null, agentRunId: run.id, runtimeSessionId: session.id,
+      occurredAt: now, payload: { role: run.role, access: run.access,
+        harnessKey: route.candidate.harnessKey, modelKey: route.candidate.modelKey, isolation: run.isolation },
+    });
+    const job: ExecutionJob = {
+      id: newId<"ExecutionJobId">(), idempotencyKey, requestFingerprint: fingerprint,
+      runtimeSessionId: session.id, agentRunId: run.id, orchestratorId: task.orchestratorId,
+      executionNodeId: executionNode.id, workspaceId: task.workspaceId, projectId: task.projectId,
+      operationId: task.operationId, taskId: task.id, repositoryId: null,
+      correlationId: task.correlationId, causationId: dispatchEvent.id, handoffCheckpointId: null, pendingApprovalId: null,
+      status: "planned", claimEpoch: null, leaseUntil: null, startedAt: null, endedAt: null,
+      outcome: null, createdAt: now, updatedAt: now,
+    };
 
-    await this.deps.repos.transaction(async (repos) => {
+    try { await this.deps.repos.transaction(async (repos) => {
       await repos.runtimeSessions.insert(session);
       await repos.agentRuns.insert(run);
-      await this.emit(repos, {
-        type: "workforce.dispatch_planned",
-        workspaceId: task.workspaceId,
-        projectId: task.projectId,
-        aggregateType: "agent_run",
-        aggregateId: run.id,
-        correlationId: task.correlationId,
-        agentRunId: run.id,
-        runtimeSessionId: session.id,
-        occurredAt: now,
-        payload: {
-          role: run.role,
-          access: run.access,
-          harnessKey: route.candidate.harnessKey,
-          modelKey: route.candidate.modelKey,
-          isolation: run.isolation,
-        },
-      });
-    });
+      await repos.events.append(dispatchEvent);
+      const inserted = await repos.executionJobs.insert(job);
+      if (inserted.id !== job.id) throw new DomainError("CONFLICT", "Duplicate dispatch request");
+    }); } catch (error) {
+      if (error instanceof DomainError && error.code === "CONFLICT") {
+        const prior = await this.deps.repos.executionJobs.getByIdempotencyKey(task.workspaceId, idempotencyKey);
+        if (prior) return this.existingDispatch(prior, fingerprint);
+      }
+      throw error;
+    }
 
-    return { status: "planned", run, session, route: route.candidate };
+    return { status: "planned", run, session, route: route.candidate, job };
+  }
+
+  private async existingDispatch(job: ExecutionJob, fingerprint: string): Promise<DispatchResult> {
+    if (job.requestFingerprint !== fingerprint) throw new DomainError("CONFLICT", "Idempotency key has different request content");
+    if (!job.agentRunId) throw new DomainError("INVARIANT", "Dispatch job has no run");
+    const run = await this.mustRun(job.agentRunId);
+    const session = await this.mustSession(job.runtimeSessionId);
+    return { status: "existing", run, session, job };
   }
 
   async planMindSession(input: {
@@ -624,6 +711,7 @@ export class Kernel {
     operationId?: OperationId | null;
     role?: string;
     profile?: ExecutionProfile | null;
+    handoffId?: RuntimeHandoffId;
   }): Promise<MindPlan> {
     const orchestrator = await this.mustOrchestrator(input.orchestratorId);
     if (orchestrator.status !== "active") {
@@ -635,14 +723,15 @@ export class Kernel {
       throw new DomainError("INVARIANT", "Operation is outside the orchestrator workspace");
     }
     const role = input.role?.trim() || "orchestrator";
+    const existing = await this.deps.repos.runtimeSessions.latestForOrchestrator(orchestrator.id, "orchestrator_mind");
     const route = await this.chooseRoute({
       role,
       workspaceId: orchestrator.workspaceId,
       projectId: orchestrator.projectId,
       operationId: operation?.id ?? null,
       profile: input.profile ?? null,
+      excludeHarnessIds: input.explicitSwitch && existing ? [existing.harnessId] : [],
     });
-    const existing = await this.deps.repos.runtimeSessions.latestForOrchestrator(orchestrator.id, "orchestrator_mind");
     const selected = route.ok ? { harnessId: route.candidate.harnessId, modelId: route.candidate.modelId } : null;
     const harnessStatus = route.ok ? await this.deps.runtime.status(route.candidate.harnessKey) : null;
     const decision = decideSessionReuse({
@@ -672,6 +761,15 @@ export class Kernel {
     if (!route.ok || !selected) {
       throw new DomainError("NO_ROUTE", `No available runtime for role ${role}`);
     }
+    const handoff = existing ? await this.deps.repos.runtimeHandoffs.latestForPredecessor(existing.id) : null;
+    if (input.handoffId && (handoff?.id !== input.handoffId || handoff.status !== "checkpointed")) {
+      throw new DomainError("HANDOFF_REQUIRED", "The requested handoff is not checkpointed for this session");
+    }
+    if (existing && (existing.status === "active" || existing.status === "starting")) {
+      if (!handoff?.checkpointId || handoff.status !== "checkpointed") {
+        throw new DomainError("HANDOFF_REQUIRED", "Durable handoff checkpoint is required before replacing a live mind session");
+      }
+    }
     const now = this.deps.clock();
     const session: RuntimeSession = {
       id: newId<"RuntimeSessionId">(),
@@ -692,6 +790,15 @@ export class Kernel {
     };
     await this.deps.repos.transaction(async (repos) => {
       await repos.runtimeSessions.insert(session);
+      if (input.handoffId) {
+        const linked = await repos.runtimeHandoffs.transition(input.handoffId, "checkpointed", "successor_planned", { successorSessionId: session.id }, now);
+        if (!linked) throw new DomainError("CONFLICT", "Handoff changed before successor planning");
+        await this.emit(repos, { type: "runtime_handoff.successor_planned", workspaceId: orchestrator.workspaceId,
+          projectId: orchestrator.projectId, aggregateType: "runtime_handoff", aggregateId: input.handoffId,
+          correlationId: handoff!.correlationId, causationId: handoff!.causationId,
+          runtimeSessionId: session.id, occurredAt: now, payload: { predecessorSessionId: existing!.id },
+        });
+      }
       await this.emit(repos, {
         type: "runtime_session.planned",
         workspaceId: orchestrator.workspaceId,
@@ -708,6 +815,45 @@ export class Kernel {
     return { action: "open", reason: decision.reason, session, closePreviousSessionId: previous };
   }
 
+  async planMindTurn(input: { sessionId: RuntimeSessionId; idempotencyKey: string; textDigest: string; operationId?: OperationId | null }): Promise<ExecutionJob> {
+    const session = await this.mustSession(input.sessionId);
+    if (session.purpose !== "orchestrator_mind" || session.status !== "active") throw new DomainError("INVALID_TRANSITION", "Mind session is not active");
+    const orchestrator = await this.mustOrchestrator(session.orchestratorId);
+    const operation = input.operationId ? await this.mustOperation(input.operationId) : null;
+    if (operation && operation.workspaceId !== orchestrator.workspaceId) throw new DomainError("FORBIDDEN", "Mind turn operation is outside the workspace");
+    const handoff = await this.deps.repos.runtimeHandoffs.findBySuccessor(session.id);
+    const sessionEvents = await this.deps.repos.events.listByAggregate("runtime_session", session.id);
+    const key = requireText(input.idempotencyKey, "idempotencyKey");
+    const digest = requireText(input.textDigest, "textDigest");
+    const prior = await this.deps.repos.executionJobs.getByIdempotencyKey(orchestrator.workspaceId, key);
+    if (prior) {
+      if (prior.runtimeSessionId !== session.id || prior.requestFingerprint !== digest) throw new DomainError("CONFLICT", "Mind turn key changed meaning");
+      return prior;
+    }
+    const now = this.deps.clock();
+    const job: ExecutionJob = {
+      id: newId<"ExecutionJobId">(), idempotencyKey: key, requestFingerprint: digest,
+      runtimeSessionId: session.id, agentRunId: null, orchestratorId: orchestrator.id,
+      executionNodeId: session.executionNodeId, workspaceId: orchestrator.workspaceId,
+      projectId: orchestrator.projectId, operationId: operation?.id ?? handoff?.operationId ?? null, taskId: null, repositoryId: null,
+      correlationId: session.correlationId, causationId: handoff?.causationId ?? sessionEvents.at(-1)?.id ?? null,
+      handoffCheckpointId: handoff?.checkpointId ?? null, pendingApprovalId: null,
+      status: "planned", claimEpoch: null, leaseUntil: null, startedAt: null, endedAt: null,
+      outcome: null, createdAt: now, updatedAt: now,
+    };
+    return this.deps.repos.transaction(async (repos) => {
+      const inserted = await repos.executionJobs.insert(job);
+      if (inserted.id !== job.id) {
+        if (inserted.runtimeSessionId !== session.id || inserted.requestFingerprint !== digest) throw new DomainError("CONFLICT", "Mind turn key changed meaning");
+        return inserted;
+      }
+      await this.emit(repos, { type: "mind_turn.planned", workspaceId: job.workspaceId, projectId: job.projectId,
+        aggregateType: "execution_job", aggregateId: job.id, correlationId: job.correlationId,
+        runtimeSessionId: session.id, occurredAt: now, payload: { idempotencyKey: key } });
+      return job;
+    });
+  }
+
   async recordCheckpoint(input: {
     orchestratorId: OrchestratorId;
     runtimeSessionId?: RuntimeSessionId | null;
@@ -715,6 +861,7 @@ export class Kernel {
     taskId?: TaskId | null;
     trigger: CheckpointTrigger;
     state: CheckpointState;
+    causationId?: EventId | null;
   }): Promise<Checkpoint> {
     const orchestrator = await this.mustOrchestrator(input.orchestratorId);
     const operation = input.operationId ? await this.mustOperation(input.operationId) : null;
@@ -761,6 +908,7 @@ export class Kernel {
         aggregateType: "checkpoint",
         aggregateId: checkpoint.id,
         correlationId: checkpoint.correlationId,
+        causationId: input.causationId ?? null,
         runtimeSessionId: checkpoint.runtimeSessionId,
         occurredAt: now,
         payload: { trigger: checkpoint.trigger },
@@ -769,12 +917,167 @@ export class Kernel {
     return checkpoint;
   }
 
+  async recordRuntimeLifecycle(input: {
+    executionJobId: ExecutionJobId;
+    signal: RuntimeLifecycleSignal;
+    checkpointState?: RuntimeCheckpointState;
+    digest?: RuntimeDigestSource;
+  }): Promise<{ checkpoint: Checkpoint; queuedDigest: boolean }> {
+    const job = await this.deps.repos.executionJobs.get(input.executionJobId);
+    if (!job) throw new DomainError("NOT_FOUND", "Execution job was not found");
+    if (!["running", "awaiting_approval", "completed", "failed", "interrupted"].includes(job.status)) {
+      throw new DomainError("INVALID_TRANSITION", "Runtime lifecycle cannot flush before execution starts");
+    }
+    const signal = input.signal;
+    const state: CheckpointState = input.checkpointState ?? {
+      phase: signal, completed: [], remaining: [], importantFiles: [], risks: [], notes: `Runtime lifecycle: ${signal}`,
+    };
+    assertCheckpointState(state);
+    const digest = input.digest ?? {
+      sourceCursor: `lifecycle:${signal}`, sourceBytes: `${job.id}:${signal}`, summary: `Runtime lifecycle: ${signal}`,
+      observedDecisions: [], observedFindings: [], touchedArtifacts: [], verificationResult: null, openQuestions: [],
+    };
+    if (!digest.sourceCursor.trim() || !digest.sourceBytes || !digest.summary.trim() || digest.sourceBytes.length > 1_000_000) {
+      throw new DomainError("INVALID_TEXT", "Runtime lifecycle digest source is invalid or too large");
+    }
+    const sourceDigest = createHash("sha256").update(signal).update("\0").update(digest.sourceCursor).update("\0").update(digest.sourceBytes).digest("hex");
+    const now = this.deps.clock();
+    const trigger: CheckpointTrigger = signal === "pre_compaction" ? "before_compaction"
+      : signal === "session_ending" ? "before_user_visible_completion"
+      : signal === "turn_completed" ? "phase_completed"
+      : signal === "approval_pause" ? "before_risky_change"
+      : signal === "runtime_failure" ? "after_failed_attempt" : "before_runtime_switch";
+    const checkpoint: Checkpoint = {
+      id: newId<"CheckpointId">(), orchestratorId: job.orchestratorId, workspaceId: job.workspaceId,
+      runtimeSessionId: job.runtimeSessionId, operationId: job.operationId, taskId: job.taskId,
+      correlationId: job.correlationId, trigger, state, createdAt: now,
+    };
+    const ingestionId = newId<"DigestIngestionId">();
+    const latestJobEvent = (await this.deps.repos.events.listByAggregate("execution_job", job.id)).at(-1);
+    return this.deps.repos.transaction(async (repos) => {
+      const stored = await repos.digestIngestions.enqueue({ id: ingestionId, executionJobId: job.id,
+        sourceDigest, sourceCursor: digest.sourceCursor,
+        payload: { executionJobId: job.id, runtimeSessionId: job.runtimeSessionId, agentRunId: job.agentRunId,
+          workspaceId: job.workspaceId, projectId: job.projectId, operationId: job.operationId, taskId: job.taskId,
+          sourceDigest, sourceCursor: digest.sourceCursor, summary: digest.summary.trim(),
+          observedDecisions: digest.observedDecisions, observedFindings: digest.observedFindings,
+          touchedArtifacts: digest.touchedArtifacts, verificationResult: digest.verificationResult,
+          openQuestions: digest.openQuestions },
+        status: "pending", attempts: 0, nextAttemptAt: now, lastError: null, digestId: null, createdAt: now, updatedAt: now });
+      if (stored.id !== ingestionId) {
+        const prior = (await repos.events.listByAggregate("execution_job", job.id))
+          .find((event) => event.type === "runtime.lifecycle" && event.payload.sourceDigest === sourceDigest);
+        const existing = typeof prior?.payload.checkpointId === "string"
+          ? await repos.checkpoints.get(prior.payload.checkpointId as CheckpointId) : null;
+        if (!existing) throw new DomainError("INVARIANT", "Repeated flush has no checkpoint");
+        return { checkpoint: existing, queuedDigest: false };
+      }
+      await repos.checkpoints.insert(checkpoint);
+      await this.emit(repos, { type: "runtime.lifecycle", workspaceId: job.workspaceId, projectId: job.projectId,
+        aggregateType: "execution_job", aggregateId: job.id, correlationId: job.correlationId,
+        causationId: latestJobEvent?.id ?? job.causationId, runtimeSessionId: job.runtimeSessionId,
+        agentRunId: job.agentRunId, occurredAt: now, payload: { signal, sourceDigest, checkpointId: checkpoint.id },
+      });
+      await this.emit(repos, { type: "checkpoint.created", workspaceId: job.workspaceId, projectId: job.projectId,
+        aggregateType: "checkpoint", aggregateId: checkpoint.id, correlationId: job.correlationId,
+        causationId: latestJobEvent?.id ?? job.causationId, runtimeSessionId: job.runtimeSessionId,
+        agentRunId: job.agentRunId, occurredAt: now, payload: { trigger, signal },
+      });
+      return { checkpoint, queuedDigest: true };
+    });
+  }
+
+  async requestHandoff(input: {
+    predecessorSessionId: RuntimeSessionId;
+    operationId?: OperationId | null;
+    taskId?: TaskId | null;
+    reason: string;
+    checkpointState: CheckpointState;
+    repositoryState: Record<string, unknown>;
+    digestId?: ExecutionDigestId | null;
+    causationId?: EventId | null;
+  }): Promise<{ handoff: RuntimeHandoff; plan: MindPlan }> {
+    const predecessor = await this.mustSession(input.predecessorSessionId);
+    if (predecessor.purpose !== "orchestrator_mind") throw new DomainError("INVARIANT", "Handoff requires a mind session");
+    const ongoing = await this.deps.repos.runtimeHandoffs.latestForPredecessor(predecessor.id);
+    if (ongoing && ["requested", "checkpointed", "successor_planned", "successor_ready"].includes(ongoing.status)) {
+      throw new DomainError("CONFLICT", "A handoff is already in progress for this session");
+    }
+    const orchestrator = await this.mustOrchestrator(predecessor.orchestratorId);
+    const now = this.deps.clock();
+    const handoff: RuntimeHandoff = {
+      id: newId<"RuntimeHandoffId">(), predecessorSessionId: predecessor.id, successorSessionId: null,
+      orchestratorId: orchestrator.id, workspaceId: orchestrator.workspaceId,
+      operationId: input.operationId ?? null, taskId: input.taskId ?? null, checkpointId: null,
+      digestId: input.digestId ?? null, repositoryState: input.repositoryState,
+      reason: requireText(input.reason, "reason"), status: "requested",
+      correlationId: predecessor.correlationId, causationId: input.causationId ?? null,
+      createdAt: now, updatedAt: now,
+    };
+    await this.deps.repos.transaction(async (repos) => {
+      await repos.runtimeHandoffs.insert(handoff);
+      await this.emit(repos, { type: "runtime_handoff.requested", workspaceId: handoff.workspaceId,
+        projectId: orchestrator.projectId, aggregateType: "runtime_handoff", aggregateId: handoff.id,
+        correlationId: handoff.correlationId, causationId: handoff.causationId,
+        runtimeSessionId: predecessor.id, occurredAt: now, payload: { reason: handoff.reason },
+      });
+      const checkpoint = await this.recordCheckpoint({
+        orchestratorId: orchestrator.id, runtimeSessionId: predecessor.id,
+        operationId: input.operationId, taskId: input.taskId,
+        trigger: "before_runtime_switch", state: input.checkpointState,
+        causationId: handoff.causationId,
+      });
+      if (!(await repos.runtimeHandoffs.transition(handoff.id, "requested", "checkpointed", { checkpointId: checkpoint.id }, this.deps.clock()))) {
+        throw new DomainError("CONFLICT", "Handoff changed before checkpoint was linked");
+      }
+      await this.emit(repos, { type: "runtime_handoff.checkpointed", workspaceId: handoff.workspaceId,
+        projectId: orchestrator.projectId, aggregateType: "runtime_handoff", aggregateId: handoff.id,
+        correlationId: handoff.correlationId, causationId: handoff.causationId,
+        runtimeSessionId: predecessor.id, occurredAt: this.deps.clock(), payload: { checkpointId: checkpoint.id },
+      });
+    });
+    try {
+      const plan = await this.planMindSession({
+        orchestratorId: orchestrator.id, executionNodeId: predecessor.executionNodeId,
+        contextHealth: "healthy", explicitSwitch: true, operationId: input.operationId, handoffId: handoff.id,
+      });
+      if (plan.action !== "open") throw new DomainError("INVARIANT", "Handoff successor was not planned");
+      return { handoff: (await this.deps.repos.runtimeHandoffs.get(handoff.id))!, plan };
+    } catch (error) {
+      const failedAt = this.deps.clock();
+      await this.deps.repos.transaction(async (repos) => {
+        if (!(await repos.runtimeHandoffs.transition(handoff.id, "checkpointed", "failed", {}, failedAt))) return;
+        await this.emit(repos, { type: "runtime_handoff.failed", workspaceId: handoff.workspaceId,
+          projectId: orchestrator.projectId, aggregateType: "runtime_handoff", aggregateId: handoff.id,
+          correlationId: handoff.correlationId, causationId: handoff.causationId,
+          runtimeSessionId: predecessor.id, occurredAt: failedAt,
+          payload: { reason: error instanceof Error ? error.message : "successor planning failed" },
+        });
+      });
+      throw error;
+    }
+  }
+
+  async resumeHandoff(id: RuntimeHandoffId): Promise<{ handoff: RuntimeHandoff; plan: MindPlan }> {
+    const handoff = await this.deps.repos.runtimeHandoffs.get(id);
+    if (!handoff || !handoff.checkpointId || handoff.status !== "checkpointed") {
+      throw new DomainError("INVALID_TRANSITION", "Only a checkpointed handoff can plan a successor");
+    }
+    const predecessor = await this.mustSession(handoff.predecessorSessionId);
+    const plan = await this.planMindSession({ orchestratorId: handoff.orchestratorId,
+      executionNodeId: predecessor.executionNodeId, contextHealth: "healthy", explicitSwitch: true,
+      operationId: handoff.operationId, handoffId: handoff.id });
+    if (plan.action !== "open") throw new DomainError("INVARIANT", "Handoff successor was not planned");
+    return { handoff: (await this.deps.repos.runtimeHandoffs.get(id))!, plan };
+  }
+
   async decideApproval(id: ApprovalId, status: Exclude<ApprovalStatus, "pending">): Promise<Approval> {
     const approval = await this.mustApproval(id);
     if (approval.status !== "pending") {
       throw new DomainError("INVALID_TRANSITION", "Only a pending approval can be decided");
     }
     const now = this.deps.clock();
+    const approvalEvents = await this.deps.repos.events.listByAggregate("approval", approval.id);
     await this.deps.repos.transaction(async (repos) => {
       await repos.approvals.decide(id, status, now);
       await this.emit(repos, {
@@ -784,6 +1087,7 @@ export class Kernel {
         aggregateType: "approval",
         aggregateId: approval.id,
         correlationId: approval.correlationId,
+        causationId: approvalEvents.at(-1)?.id ?? null,
         occurredAt: now,
         payload: { status, action: approval.action },
       });
@@ -797,6 +1101,7 @@ export class Kernel {
     projectId: ProjectId | null;
     operationId: OperationId | null;
     profile: ExecutionProfile | null;
+    excludeHarnessIds?: HarnessId[];
   }) {
     const [policies, routes, harnesses, models] = await Promise.all([
       this.deps.repos.routingPolicies.listEnabled(),
@@ -806,7 +1111,7 @@ export class Kernel {
     ]);
     const statusByHarnessKey: Record<string, RuntimeStatus> = {};
     for (const harness of harnesses) {
-      statusByHarnessKey[harness.key] = await this.deps.runtime.status(harness.key);
+      statusByHarnessKey[harness.key] = input.excludeHarnessIds?.includes(harness.id) ? "OFFLINE" : await this.deps.runtime.status(harness.key);
     }
     return selectRoute({
       role: input.role,

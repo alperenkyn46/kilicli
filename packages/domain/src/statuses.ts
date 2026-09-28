@@ -39,11 +39,21 @@ export type AgentRunKind = (typeof AGENT_RUN_KINDS)[number];
 export const AGENT_RUN_STATUSES = [
   "planned",
   "running",
+  "awaiting_approval",
   "completed",
   "failed",
   "cancelled",
 ] as const;
 export type AgentRunStatus = (typeof AGENT_RUN_STATUSES)[number];
+
+export const EXECUTION_JOB_STATUSES = ["planned", "claimed", "bootstrapping", "running", "awaiting_approval", "completed", "failed", "interrupted", "cancelled"] as const;
+export type ExecutionJobStatus = (typeof EXECUTION_JOB_STATUSES)[number];
+
+export const RUNTIME_HANDOFF_STATUSES = ["requested", "checkpointed", "successor_planned", "successor_ready", "predecessor_retired", "failed"] as const;
+export type RuntimeHandoffStatus = (typeof RUNTIME_HANDOFF_STATUSES)[number];
+
+export const DIGEST_INGESTION_STATUSES = ["pending", "processing", "completed", "retry"] as const;
+export type DigestIngestionStatus = (typeof DIGEST_INGESTION_STATUSES)[number];
 
 export const ACCESS_MODES = ["read_only", "write", "none"] as const;
 export type AccessMode = (typeof ACCESS_MODES)[number];

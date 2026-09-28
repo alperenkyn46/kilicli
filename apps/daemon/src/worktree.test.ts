@@ -39,6 +39,23 @@ describe("git worktree isolation", () => {
     await manager.remove({ repositoryRoot, worktreePath });
     await expect(exec("git", ["show-ref", "--verify", `refs/heads/${branch}`], { cwd: repositoryRoot })).resolves.toBeTruthy();
   });
+
+  it("prunes stale Git metadata before a missing worktree can be retired", async () => {
+    const repositoryRoot = await temporaryDirectory();
+    await exec("git", ["init", "-b", "main"], { cwd: repositoryRoot, env: gitEnv });
+    await writeFile(join(repositoryRoot, "README.md"), "base\n");
+    await exec("git", ["add", "README.md"], { cwd: repositoryRoot, env: gitEnv });
+    await exec("git", ["commit", "-m", "base"], { cwd: repositoryRoot, env: gitEnv });
+    const branch = "kilic/task/stale";
+    const worktreePath = join(await temporaryDirectory(), "worker");
+    const manager = new GitWorktreeManager();
+    await manager.create({ repositoryRoot, worktreePath, branch, baseRef: "main" });
+    await rm(worktreePath, { recursive: true });
+    await manager.pruneMissing({ repositoryRoot, worktreePath });
+    const { stdout } = await exec("git", ["worktree", "list", "--porcelain"], { cwd: repositoryRoot });
+    expect(stdout).not.toContain(`worktree ${worktreePath}`);
+    await expect(exec("git", ["show-ref", "--verify", `refs/heads/${branch}`], { cwd: repositoryRoot })).resolves.toBeTruthy();
+  });
 });
 
 async function temporaryDirectory(): Promise<string> {

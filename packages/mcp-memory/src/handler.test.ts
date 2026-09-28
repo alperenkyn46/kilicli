@@ -11,6 +11,7 @@ describe("memory protocol adapter", () => {
     const workspaceId = newId<"WorkspaceId">();
     await repos.workspaces.insert({ id: workspaceId, name: "Ecosystem", slug: "ecosystem", createdAt: now, updatedAt: now });
     const memory = new MemoryService(repos, () => now);
+    const principal = { kind: "tool" as const, executionJobId: newId<"ExecutionJobId">(), agentRunId: null, workspaceId, projectId: null, operationId: null, taskId: null };
 
     const result = await handleMemoryTool(memory, "memory.remember_fact", {
       scopeType: "workspace",
@@ -19,8 +20,8 @@ describe("memory protocol adapter", () => {
       body: "Kısa özet yaz.",
       knowledgeClass: "authoritative",
       language: "tr",
-    });
+    }, principal);
     expect(result.content[0]?.text).toContain("Kısa özet yaz.");
-    await expect(handleMemoryTool(memory, "query", { sql: "select * from users" })).rejects.toThrow(/Unknown memory tool/);
+    await expect(handleMemoryTool(memory, "query", { sql: "select * from users" }, principal)).rejects.toThrow(/Unknown memory tool/);
   });
 });
