@@ -252,6 +252,50 @@ describe("postgresql foundation", () => {
     await database.close();
   });
 
+  it("atomically binds a repository and rejects cross-project or retry rebinding", async () => {
+    await migrateDatabase(connectionString);
+    const firstDb = createDatabase(connectionString);
+    const secondDb = createDatabase(connectionString);
+    try {
+      const first = createPostgresRepositories(firstDb.db);
+      const second = createPostgresRepositories(secondDb.db);
+      await seedFoundationCatalog(first);
+      const now = new Date();
+      const workspaceId = randomUUID(), projectId = randomUUID(), otherProjectId = randomUUID();
+      const orchestratorId = randomUUID(), nodeId = randomUUID(), sessionId = randomUUID();
+      const repoA = randomUUID(), repoB = randomUUID(), foreignRepo = randomUUID();
+      const harness = await first.harnesses.getByKey("claude-code");
+      if (!harness) throw new Error("Missing harness");
+      const model = await first.models.findByHarnessAndKey(harness.id, "default");
+      if (!model) throw new Error("Missing model");
+      await sql`insert into workspaces (id,name,slug,created_at,updated_at) values (${workspaceId},'Binding',${workspaceId},${now},${now})`;
+      for (const id of [projectId, otherProjectId]) await sql`insert into projects (id,workspace_id,name,slug,created_at,updated_at) values (${id},${workspaceId},'Binding',${id},${now},${now})`;
+      for (const [id, scope] of [[repoA,projectId],[repoB,projectId],[foreignRepo,otherProjectId]]) {
+        await sql`insert into repositories (id,project_id,name,default_branch,created_at,updated_at) values (${id!},${scope!},'Repo','main',${now},${now})`;
+      }
+      await sql`insert into orchestrators (id,workspace_id,project_id,kind,display_name,status,created_at,updated_at) values (${orchestratorId},${workspaceId},${projectId},'project','Project','active',${now},${now})`;
+      await sql`insert into execution_nodes (id,machine_key,display_name,kind,status,created_at,updated_at) values (${nodeId},${nodeId},'Node','local','online',${now},${now})`;
+      await sql`insert into runtime_sessions (id,orchestrator_id,execution_node_id,harness_id,model_id,purpose,status,correlation_id,started_at,created_at,updated_at) values (${sessionId},${orchestratorId},${nodeId},${harness.id},${model.id},'orchestrator_mind','starting',${randomUUID()},${now},${now},${now})`;
+      const job = { id: newId<"ExecutionJobId">(), idempotencyKey: randomUUID(), requestFingerprint: "binding",
+        runtimeSessionId: asId<"RuntimeSessionId">(sessionId,"sessionId"), agentRunId: null,
+        orchestratorId: asId<"OrchestratorId">(orchestratorId,"orchestratorId"), executionNodeId: asId<"ExecutionNodeId">(nodeId,"nodeId"),
+        workspaceId: asId<"WorkspaceId">(workspaceId,"workspaceId"), projectId: asId<"ProjectId">(projectId,"projectId"), operationId: null, taskId: null,
+        repositoryId: null, correlationId: newCorrelationId(), causationId: null, handoffCheckpointId: null, pendingApprovalId: null,
+        status: "planned" as const, claimEpoch: null, leaseUntil: null, startedAt: null, endedAt: null, outcome: null, createdAt: now, updatedAt: now };
+      await first.executionJobs.insert(job);
+      expect(await first.executionJobs.bindRepository(job.id, asId<"RepositoryId">(foreignRepo,"repositoryId"), job.executionNodeId,now)).toBe(false);
+      await expect(sql`update execution_jobs set repository_id=${foreignRepo} where id=${job.id}`).rejects.toThrow(/foreign key/);
+      const results = await Promise.all([first.executionJobs.bindRepository(job.id,asId<"RepositoryId">(repoA,"repositoryId"),job.executionNodeId,now),
+        second.executionJobs.bindRepository(job.id,asId<"RepositoryId">(repoB,"repositoryId"),job.executionNodeId,now)]);
+      expect(results.filter(Boolean)).toHaveLength(1);
+      const stored = await first.executionJobs.get(job.id);
+      expect([repoA,repoB]).toContain(stored?.repositoryId);
+      const changed = stored!.repositoryId === repoA ? repoB : repoA;
+      await expect(sql`update execution_jobs set repository_id=${changed} where id=${job.id}`).rejects.toThrow(/immutable/);
+      await expect(sql`update execution_jobs set repository_id=null where id=${job.id}`).rejects.toThrow(/immutable/);
+    } finally { await firstDb.close(); await secondDb.close(); }
+  });
+
   it("deduplicates concurrent jobs and permits one atomic node claim", async () => {
     await migrateDatabase(connectionString);
     const firstDb = createDatabase(connectionString);

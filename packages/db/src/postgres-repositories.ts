@@ -513,6 +513,14 @@ function bind(db: Database): Repositories {
       async listByNode(nodeId) {
         return (await db.select().from(schema.executionJobs).where(eq(schema.executionJobs.executionNodeId, nodeId))).map(mapExecutionJob);
       },
+      async bindRepository(jobId, repositoryId, nodeId, now) {
+        const rows = await db.update(schema.executionJobs).set({ repositoryId, updatedAt: now }).where(and(
+          eq(schema.executionJobs.id, jobId), eq(schema.executionJobs.executionNodeId, nodeId),
+          eq(schema.executionJobs.status, "planned"), isNull(schema.executionJobs.repositoryId),
+          sql`exists (select 1 from repositories where id = ${repositoryId} and project_id = ${schema.executionJobs.projectId})`,
+        )).returning({ id: schema.executionJobs.id });
+        return rows.length === 1;
+      },
       async claim(jobId, nodeId, epoch, leaseUntil, now) {
         const rows = await db.update(schema.executionJobs).set({ status: "claimed", claimEpoch: epoch, leaseUntil, updatedAt: now }).where(and(eq(schema.executionJobs.id, jobId), eq(schema.executionJobs.executionNodeId, nodeId), eq(schema.executionJobs.status, "planned"), sql`exists (select 1 from execution_nodes where id = ${nodeId} and boot_id = ${epoch})`)).returning({ id: schema.executionJobs.id });
         return rows.length === 1;

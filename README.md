@@ -2,7 +2,7 @@
 
 Kılıç'ın kaynak deposu. Yönetilecek uygulamalar burada durmaz; workspace, project ve repository kayıtları olarak bağlanır.
 
-Bu faz foundation'dır: domain, PostgreSQL şeması, Kernel, runtime sözleşmesi, daemon sınırı ve CLI iskeleti. Gerçek bir coding harness'ına henüz bağlanmaz.
+Domain, PostgreSQL şeması, Kernel, runtime sözleşmesi ve daemon foundation'ı üzerinde ilk gerçek read-only Claude worker dilimi vardır. Günlük kullanıcı akışı ve CLI henüz yalnız health seviyesindedir. Canlı adapter testleri ayrı opt-in runner ile çalışır.
 
 ## Çalıştırma
 
@@ -35,8 +35,9 @@ Daemon ve control API yalnızca `127.0.0.1` üzerinde dinler.
 - `apps/control-api`: aynı Kernel'ın HTTP yüzü. Process açmaz.
 - `apps/cli`: daemon health istemcisi.
 - `packages/runtime-contract`: adapter sözleşmesi ve mock conformance.
-- `packages/adapter-*`: henüz implement edilmedi.
+- `packages/adapter-claude`: brokered read-only dilim ve opt-in canlı test; daemon main otomatik kaydetmez.
+- `packages/adapter-codex`, `packages/adapter-cursor`: henüz implement edilmedi.
 - `packages/mcp-*`: tool adapter. Domain kuralı burada değildir.
 - `apps/web`: sonraki client. UI yok.
 
-Kararlar `docs/adr/` altındadır. Doctrine kök `AGENTS.md` dosyasındadır.
+Kararlar `docs/adr/` altındadır. Runtime doctrine `identity/AGENTS.md` dosyasındadır; kök `AGENTS.md` source repository geliştirme talimatıdır.

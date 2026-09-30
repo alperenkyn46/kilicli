@@ -9,10 +9,12 @@
     "start": "tsx src/main.ts"
   },
   "dependencies": {
+    "@kilic/adapter-claude": "workspace:*",
     "@hono/node-server": "^1.19.0",
     "@kilic/db": "workspace:*",
     "@kilic/domain": "workspace:*",
     "@kilic/kernel": "workspace:*",
+    "@kilic/memory": "workspace:*",
     "@kilic/observability": "workspace:*",
     "@kilic/runtime-contract": "workspace:*",
     "@kilic/shared": "workspace:*",

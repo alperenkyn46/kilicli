@@ -29,3 +29,4 @@ Foundation kararları. `KILIC_ARCHITECTURE.md` ile çelişen yerler ilgili ADR'd
 | [0023](0023-execution-jobs-and-durable-handoff.md) | Execution job, effect authorization ve handoff |
 | [0024](0024-execution-digests-and-bounded-context.md) | Execution digest ve bounded bootstrap |
 | [0025](0025-runtime-mediation-and-continuity.md) | Brokered effect, approval continuation ve lifecycle flush |
+| [0026](0026-first-mediated-runtime-slice.md) | İlk gerçek brokered read-only runtime dilimi |

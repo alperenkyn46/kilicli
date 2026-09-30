@@ -38,6 +38,7 @@ export class ExecutionPlane {
     if (input.retry && (job.status === "failed" || job.status === "interrupted")) {
       job = await this.deps.control.rearmJob(job.id);
     }
+    await this.deps.control.bindRepositoryForRun(input.repositoryId, run.id, this.deps.nodeId);
     if (job.status === "planned") {
       await this.deps.control.claimJob(job.id, this.deps.nodeId, this.deps.bootId);
       await this.deps.control.transitionJob(job.id, "claimed", "bootstrapping");

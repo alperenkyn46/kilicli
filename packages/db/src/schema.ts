@@ -811,6 +811,8 @@ export const executionJobs = pgTable(
     oneOf(table.status, EXECUTION_JOB_STATUSES, "execution_jobs_status_ck"),
     check("execution_jobs_claim_ck", sql`(${table.status} = 'planned' AND ${table.claimEpoch} IS NULL) OR (${table.status} <> 'planned' AND ${table.claimEpoch} IS NOT NULL)`),
     check("execution_jobs_approval_ck", sql`${table.status} <> 'awaiting_approval' OR ${table.pendingApprovalId} IS NOT NULL`),
+    check("execution_jobs_repository_project_ck", sql`${table.repositoryId} IS NULL OR ${table.projectId} IS NOT NULL`),
+    foreignKey({ columns: [table.repositoryId, table.projectId], foreignColumns: [repositories.id, repositories.projectId], name: "execution_jobs_repository_scope_fk" }),
     foreignKey({ columns: [table.orchestratorId, table.workspaceId], foreignColumns: [orchestrators.id, orchestrators.workspaceId], name: "execution_jobs_orchestrator_scope_fk" }),
     foreignKey({ columns: [table.runtimeSessionId, table.orchestratorId, table.executionNodeId], foreignColumns: [runtimeSessions.id, runtimeSessions.orchestratorId, runtimeSessions.executionNodeId], name: "execution_jobs_session_scope_fk" }),
     foreignKey({ columns: [table.projectId, table.workspaceId], foreignColumns: [projects.id, projects.workspaceId], name: "execution_jobs_project_scope_fk" }),

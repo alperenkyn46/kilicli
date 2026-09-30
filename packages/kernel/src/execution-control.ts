@@ -286,6 +286,24 @@ export class ExecutionControl {
     if (!repository || repository.projectId !== run.projectId) throw new DomainError("INVARIANT", "Repository is outside the run project");
   }
 
+  async bindRepositoryForRun(repositoryId: RepositoryId, runId: AgentRunId, nodeId: ExecutionNodeId): Promise<void> {
+    await this.repositoryForRun(repositoryId, runId);
+    const job = await this.jobForRun(runId);
+    if (job.executionNodeId !== nodeId) throw new DomainError("FORBIDDEN", "Job belongs to another execution node");
+    if (job.repositoryId === repositoryId) return;
+    if (job.repositoryId !== null) throw new DomainError("CONFLICT", "Execution repository cannot change on retry");
+    await this.repos.transaction(async (repos) => {
+      const now = this.clock();
+      if (!await repos.executionJobs.bindRepository(job.id, repositoryId, nodeId, now)) {
+        if ((await repos.executionJobs.get(job.id))?.repositoryId === repositoryId) return;
+        throw new DomainError("CONFLICT", "Execution repository binding lost its expected state");
+      }
+      await repos.events.append(buildEvent({ type: "execution_job.repository_bound", aggregateType: "execution_job", aggregateId: job.id,
+        workspaceId: job.workspaceId, projectId: job.projectId, correlationId: job.correlationId, causationId: job.causationId,
+        runtimeSessionId: job.runtimeSessionId, agentRunId: job.agentRunId, occurredAt: now, payload: { repositoryId, nodeId } }));
+    });
+  }
+
   async activeWorktreeForRun(runId: AgentRunId) { return this.repos.worktrees.findActiveByRun(runId); }
 
   async worktreesForNode(nodeId: ExecutionNodeId) { return this.repos.worktrees.listByNode(nodeId); }

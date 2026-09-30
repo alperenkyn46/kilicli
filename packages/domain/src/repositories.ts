@@ -242,6 +242,7 @@ export interface Repositories {
     getByIdempotencyKey(workspaceId: WorkspaceId, key: string): Promise<ExecutionJob | null>;
     getByRun(runId: AgentRunId): Promise<ExecutionJob | null>;
     listByNode(nodeId: ExecutionNodeId): Promise<ExecutionJob[]>;
+    bindRepository(id: ExecutionJobId, repositoryId: RepositoryId, nodeId: ExecutionNodeId, now: Date): Promise<boolean>;
     claim(id: ExecutionJobId, nodeId: ExecutionNodeId, epoch: string, leaseUntil: Date, now: Date): Promise<boolean>;
     renew(id: ExecutionJobId, nodeId: ExecutionNodeId, epoch: string, leaseUntil: Date, now: Date): Promise<boolean>;
     transition(id: ExecutionJobId, from: ExecutionJobStatus, to: ExecutionJobStatus, patch: Partial<Pick<ExecutionJob, "startedAt" | "endedAt" | "outcome" | "leaseUntil" | "claimEpoch" | "pendingApprovalId">>, now: Date): Promise<boolean>;

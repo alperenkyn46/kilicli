@@ -538,6 +538,13 @@ export function createInMemoryRepositories(): Repositories {
       async getByIdempotencyKey(workspaceId, key) { return [...executionJobs.values()].find((item) => item.workspaceId === workspaceId && item.idempotencyKey === key) ?? null; },
       async getByRun(runId) { return [...executionJobs.values()].find((item) => item.agentRunId === runId) ?? null; },
       async listByNode(nodeId) { return [...executionJobs.values()].filter((item) => item.executionNodeId === nodeId); },
+      async bindRepository(id, repositoryId, nodeId, now) {
+        const job = executionJobs.get(id);
+        if (!job || job.status !== "planned" || job.repositoryId !== null || job.executionNodeId !== nodeId ||
+          repositories.get(repositoryId)?.projectId !== job.projectId) return false;
+        executionJobs.set(id, { ...job, repositoryId, updatedAt: now });
+        return true;
+      },
       async claim(id, nodeId, epoch, leaseUntil, now) {
         const job = executionJobs.get(id);
         if (!job || job.status !== "planned" || job.executionNodeId !== nodeId || executionNodes.get(nodeId)?.bootId !== epoch) return false;

@@ -137,8 +137,9 @@ export function defineRuntimeAdapterConformance(
       await iterator.next();
       const request = await iterator.next();
       expect(request.value).toMatchObject({ type: "effect_requested", request: { action: "force_push" } });
+      if (!request.value || request.value.type !== "effect_requested") throw new Error("Missing effect request");
       expect(fixture.effectCount(adapter)).toBe(0);
-      await adapter.resolveEffect(handle, "effect-1", { decision: "deny", reason: "Policy" });
+      await adapter.resolveEffect(handle, request.value.request.idempotencyKey, { decision: "deny", reason: "Policy" });
       await expect(iterator.next()).resolves.toMatchObject({ value: { type: "failed" } });
       expect(fixture.effectCount(adapter)).toBe(0);
     });
@@ -152,15 +153,18 @@ export function defineRuntimeAdapterConformance(
       const iterator = adapter.send(handle, message)[Symbol.asyncIterator]();
       await iterator.next();
       await iterator.next();
-      await expect(iterator.next()).resolves.toMatchObject({ value: { type: "effect_requested" } });
-      await adapter.resolveEffect(handle, "effect-1", { decision: "require_approval", approvalId: "approval" });
+      const requested = await iterator.next();
+      expect(requested).toMatchObject({ value: { type: "effect_requested" } });
+      if (!requested.value || requested.value.type !== "effect_requested") throw new Error("Missing effect request");
+      const requestKey = requested.value.request.idempotencyKey;
+      await adapter.resolveEffect(handle, requestKey, { decision: "require_approval", approvalId: "approval" });
       expect(fixture.effectCount(adapter)).toBe(0);
-      await adapter.resolveEffect(handle, "effect-1", { decision: "allow", grantId: "grant" });
+      await adapter.resolveEffect(handle, requestKey, { decision: "allow", grantId: "grant" });
       await expect(iterator.next()).resolves.toMatchObject({ value: { type: "completed" } });
       expect(fixture.effectCount(adapter)).toBe(0);
       expect((await collect(adapter.send(handle, message))).at(-1)).toMatchObject({ type: "completed" });
       expect(fixture.effectCount(adapter)).toBe(0);
-      await expect(adapter.resolveEffect(handle, "effect-1", { decision: "allow", grantId: "grant" })).rejects.toThrow(/pending/);
+      await expect(adapter.resolveEffect(handle, requestKey, { decision: "allow", grantId: "grant" })).rejects.toThrow(/pending/);
     });
 
     it("reports session health and resumes only when supported", async () => {
@@ -199,7 +203,10 @@ async function expectNormalized(
     if (at === "status") return adapter.status();
     if (at === "start") return adapter.start(startRequest);
     const handle = await startReady(adapter);
-    return collect(adapter.send(handle, { text: "x", executionId: "job", idempotencyKey: "turn" }));
+    const events = await collect(adapter.send(handle, { text: "x", executionId: "job", idempotencyKey: "turn" }));
+    const failure = events.at(-1);
+    if (failure?.type === "failed") throw new RuntimeAdapterError(failure.status, failure.message, true);
+    return events;
   };
 
   try {
